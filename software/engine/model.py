@@ -54,9 +54,28 @@ from .dataset import (
 )
 
 if TYPE_CHECKING:
-    from darts.models import TFTModel  # noqa: F401
+    from darts.models.forecasting.tft_model import TFTModel  # noqa: F401
 
 logger = get_logger(__name__)
+
+
+def _import_tft_model():
+    """Import :class:`darts.models.forecasting.tft_model.TFTModel` directly.
+
+    Importing the public ``darts.models`` package eagerly loads every model
+    in Darts' registry, including ``catboost_model``, which transitively
+    imports the ``catboost`` C extension. On environments where ``catboost``
+    was built against a different numpy ABI (a common mismatch on the AWS
+    SageMaker conda image), that import raises::
+
+        ValueError: numpy.dtype size changed, may indicate binary
+        incompatibility. Expected 96 from C header, got 88 from PyObject
+
+    even though we never use CatBoost. Importing the leaf submodule skips
+    the registry sweep and avoids the issue.
+    """
+    from darts.models.forecasting.tft_model import TFTModel
+    return TFTModel
 
 # ---------------------------------------------------------------------------
 # Forecast-date chunk geometry
@@ -258,7 +277,7 @@ def build_tft(
     Returns:
         An unfitted ``TFTModel``.
     """
-    from darts.models import TFTModel
+    TFTModel = _import_tft_model()
     from darts.utils.likelihood_models import QuantileRegression
 
     input_chunk, output_chunk = _resolve_chunk_lengths(forecast_date)
@@ -337,7 +356,7 @@ def save_tft(model, path: Path) -> Path:
 
 def load_tft(path: Path):
     """Load a previously-saved TFTModel + sidecar metadata."""
-    from darts.models import TFTModel
+    TFTModel = _import_tft_model()
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"no model at {path}")

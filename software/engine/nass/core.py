@@ -85,15 +85,62 @@ def _parse_nass_value(raw: Any) -> float | None:
         return None
 
 
+def _nass_redact_url(url: str) -> str:
+    """Strip the ``key=...`` query param so URLs are safe to log."""
+    import re
+    return re.sub(r"(key=)[^&]+", r"\1***", url)
+
+
 def nass_get(params: dict[str, str | int]) -> list[dict[str, Any]]:
-    """Call Quick Stats ``api_GET``; return the ``data`` list (or [])."""
+    """Call Quick Stats ``api_GET``; return the ``data`` list (or []).
+
+    Returns an **empty list** when NASS responds 4xx with the well-known
+    "the query exceeded the limit of 50000 records or no data" message — that
+    is operational, not an error, and downstream callers already cope with
+    empty frames.
+
+    For any other 4xx/5xx, raises :class:`requests.HTTPError` after first
+    logging the response body and a redacted URL, so failures on the AWS box
+    are diagnosable from the rotating log file.
+    """
     q: dict[str, Any] = {
         "key": nass_api_key(),
         "format": "JSON",
         **params,
     }
     r = requests.get(NASS_API_URL, params=q, timeout=120)
-    r.raise_for_status()
+
+    if not r.ok:
+        body = ""
+        try:
+            body = r.text[:500]
+        except Exception:  # noqa: BLE001
+            body = ""
+        # NASS uses HTTP 400 with a JSON ``{"error":["no data..."]}`` body
+        # for both "no rows match" and "result set too large". Treat the
+        # benign no-data case as an empty result so cold pulls don't crash
+        # over years/states that legitimately have nothing.
+        lowered = body.lower()
+        if r.status_code == 400 and (
+            '"no data"' in lowered
+            or "no data " in lowered
+            or "no records" in lowered
+        ):
+            print(
+                f"[nass] empty response (HTTP 400 'no data') for "
+                f"{_nass_redact_url(r.url)}",
+                file=sys.stderr,
+            )
+            return []
+        # Surface a useful diagnostic before raising — NASS error bodies are
+        # usually short JSON like ``{"error": ["..."]}``.
+        print(
+            f"[nass] HTTP {r.status_code} for {_nass_redact_url(r.url)}\n"
+            f"[nass] body: {body!r}",
+            file=sys.stderr,
+        )
+        r.raise_for_status()
+
     j: Any = r.json()
     if not isinstance(j, dict) or "data" not in j:
         return []

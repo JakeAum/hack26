@@ -24,7 +24,7 @@ Cache:
 
 from __future__ import annotations
 
-import sys
+import logging
 import time
 from typing import Iterable, Sequence
 
@@ -32,6 +32,15 @@ import pandas as pd
 import requests
 
 from ._cache import power_cache_path, smap_cache_path
+
+# Engine-wide logger so SMAP/POWER warnings land in the same rotating log file
+# as the dataset/model/forecast pipeline. Falls back to a stderr-only logger
+# if engine._logging hasn't been initialized yet.
+try:
+    from .._logging import get_logger as _get_logger  # type: ignore
+    _LOG = _get_logger(__name__)
+except Exception:  # noqa: BLE001 — engine._logging is optional at import time
+    _LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Parameter groups (same scientific selection as the original field script).
@@ -71,6 +80,24 @@ POWER_BASE_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 
 # NASA POWER's documented sentinel for "no data".
 _NODATA = -999.0
+
+# ---------------------------------------------------------------------------
+# SMAP / SMLAND degradation flag (process-local).
+#
+# NASA POWER periodically deprecates / renames SMAP-derived parameters, and
+# during such transitions every ``SMLAND`` request 422s. We don't want a cold
+# pull to spend ~99 × 1 s of useless rate-limited HTTP calls + flood stderr,
+# and we don't want users to think the run is broken (the dataset code already
+# tolerates SMAP being missing — the column is dropped from past covariates).
+#
+# After the first 422 we set ``_SMAP_BROKEN_THIS_PROCESS`` and short-circuit
+# every subsequent SMAP call: write an empty cache parquet and return empty.
+# A single banner-level log line tells the user what happened, with the URL
+# of the failing probe so they can rerun it manually if they want to confirm
+# POWER is back.
+# ---------------------------------------------------------------------------
+_SMAP_BROKEN_THIS_PROCESS: bool = False
+_SMAP_BREAK_REASON: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +193,37 @@ def fetch_county_power(
     return df
 
 
+def _empty_smap_frame(cache_path=None) -> pd.DataFrame:
+    """Return (and optionally cache) an empty SMAP frame with the right index."""
+    empty = pd.DataFrame(index=pd.MultiIndex.from_arrays(
+        [[], []], names=["date", "geoid"]
+    ))
+    if cache_path is not None:
+        try:
+            empty.to_parquet(cache_path)
+        except Exception:  # noqa: BLE001 — cache write is best-effort
+            pass
+    return empty
+
+
+def _mark_smap_broken(reason: str) -> None:
+    """Trip the process-local SMAP-broken flag once, with a banner log."""
+    global _SMAP_BROKEN_THIS_PROCESS, _SMAP_BREAK_REASON
+    if _SMAP_BROKEN_THIS_PROCESS:
+        return
+    _SMAP_BROKEN_THIS_PROCESS = True
+    _SMAP_BREAK_REASON = reason
+    _LOG.warning(
+        "NASA POWER SMAP/SMLAND is rejecting requests this run; "
+        "skipping all subsequent SMAP fetches in this process. "
+        "Reason: %s. The model trains fine without SMAP — the "
+        "SMAP_surface_sm_m3m3 past-covariate column will be empty and "
+        "automatically dropped downstream. Pass --no-smap to skip the probe "
+        "entirely on the next run.",
+        reason,
+    )
+
+
 def fetch_county_smap(
     geoid: str,
     geometry,
@@ -180,30 +238,48 @@ def fetch_county_smap(
     :data:`SMAP_FIRST_YEAR` or when the API has no data for the requested
     point. Callers should ``join(..., how="left")`` against the POWER frame
     so missing rows just show up as NaN.
+
+    If the NASA POWER ``SMLAND`` parameter is rejected once during this
+    process (HTTP 422 or similar), every subsequent call short-circuits to an
+    empty frame so we don't spend the rest of the cold pull on dead requests.
+    Re-run after restarting Python to retry SMAP from scratch.
     """
     effective_start = max(start_year, SMAP_FIRST_YEAR)
     if effective_start > end_year:
-        return pd.DataFrame(index=pd.MultiIndex.from_arrays(
-            [[], []], names=["date", "geoid"]
-        ))
+        return _empty_smap_frame()
 
     cache = smap_cache_path(geoid, effective_start, end_year)
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
+
+    if _SMAP_BROKEN_THIS_PROCESS:
+        return _empty_smap_frame(cache)
 
     lat, lon = representative_latlon(geometry, county_row=county_row)
     try:
         raw = _fetch_power_point(
             lat, lon, ("SMLAND",), effective_start, end_year,
         )
+    except requests.HTTPError as exc:  # 422 / 4xx → degrade for the whole run
+        status = getattr(exc.response, "status_code", "?")
+        body = ""
+        if exc.response is not None:
+            try:
+                body = exc.response.text[:200].replace("\n", " ")
+            except Exception:  # noqa: BLE001
+                body = ""
+        reason = (
+            f"HTTP {status} for SMLAND@({lat:.3f},{lon:.3f}) "
+            f"{effective_start}-{end_year}; body={body!r}"
+        )
+        _LOG.warning("[weather.power] SMAP fetch failed for geoid=%s: %s",
+                     geoid, reason)
+        _mark_smap_broken(reason)
+        return _empty_smap_frame(cache)
     except Exception as exc:  # noqa: BLE001 — SMAP gaps are common; degrade.
-        print(f"[weather.power] SMAP fetch failed for geoid={geoid} "
-              f"({lat:.3f},{lon:.3f}): {exc}", file=sys.stderr)
-        empty = pd.DataFrame(index=pd.MultiIndex.from_arrays(
-            [[], []], names=["date", "geoid"]
-        ))
-        empty.to_parquet(cache)
-        return empty
+        _LOG.warning("[weather.power] SMAP fetch failed for geoid=%s "
+                     "(%.3f,%.3f): %s", geoid, lat, lon, exc)
+        return _empty_smap_frame(cache)
 
     raw = raw.rename(columns={"SMLAND": "SMAP_surface_sm_m3m3"})
     raw = raw.assign(geoid=str(geoid)).set_index("geoid", append=True)
@@ -246,12 +322,12 @@ def fetch_counties_power(
                 refresh=refresh,
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[weather.power] POWER failed for geoid={geoid}: {exc}",
-                  file=sys.stderr)
+            _LOG.warning("[weather.power] POWER failed for geoid=%s: %s",
+                         geoid, exc)
             continue
         frames.append(df)
         if i % progress_every == 0 or i == n:
-            print(f"[weather.power] {i}/{n} counties processed", file=sys.stderr)
+            _LOG.info("[weather.power] %d/%d counties processed", i, n)
         # Only rate-limit when we actually hit the network.
         if not had_cache and sleep_between and i < n:
             time.sleep(sleep_between)
@@ -271,13 +347,22 @@ def fetch_counties_smap(
     sleep_between: float = 1.0,
     progress_every: int = 25,
 ) -> pd.DataFrame:
-    """Vectorized SMAP — same pattern as :func:`fetch_counties_power`."""
+    """Vectorized SMAP — same pattern as :func:`fetch_counties_power`.
+
+    Once the per-process SMAP-broken flag is tripped (see
+    :func:`fetch_county_smap`), every subsequent county is short-circuited
+    so the cold pull doesn't burn ~1 s per county on dead HTTP calls. The
+    return value is still a properly-typed (possibly empty) DataFrame so
+    downstream merges don't blow up.
+    """
     frames: list[pd.DataFrame] = []
     n = len(counties)
+    n_short_circuited = 0
     for i, (_, row) in enumerate(counties.iterrows(), start=1):
         geoid = str(row["geoid"])
         cache = smap_cache_path(geoid, max(start_year, SMAP_FIRST_YEAR), end_year)
         had_cache = cache.exists() and not refresh
+        was_broken_before = _SMAP_BROKEN_THIS_PROCESS
         df = fetch_county_smap(
             geoid=geoid,
             geometry=row.geometry,
@@ -288,12 +373,28 @@ def fetch_counties_smap(
         )
         if not df.empty:
             frames.append(df)
+        if was_broken_before:
+            n_short_circuited += 1
         if i % progress_every == 0 or i == n:
-            print(f"[weather.power] SMAP {i}/{n} counties processed",
-                  file=sys.stderr)
-        if not had_cache and sleep_between and i < n:
+            tail = (
+                f"  ({n_short_circuited} short-circuited after first 422)"
+                if _SMAP_BROKEN_THIS_PROCESS else ""
+            )
+            _LOG.info("[weather.power] SMAP %d/%d counties processed%s",
+                      i, n, tail)
+        # Don't sleep if SMAP is already broken — short-circuit is instant
+        # and the rate-limit was for the network call we're skipping.
+        if (not had_cache and not _SMAP_BROKEN_THIS_PROCESS
+                and sleep_between and i < n):
             time.sleep(sleep_between)
 
+    if _SMAP_BROKEN_THIS_PROCESS:
+        _LOG.warning(
+            "SMAP unavailable this run (POWER rejected SMLAND); "
+            "%d/%d counties returned empty frames. "
+            "Continuing without SMAP — model still trains.",
+            n, n,
+        )
     if not frames:
         return pd.DataFrame(index=pd.MultiIndex.from_arrays(
             [[], []], names=["date", "geoid"]
