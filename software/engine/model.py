@@ -556,7 +556,7 @@ def predict_tft(
     if bundle.n_series == 0:
         raise ValueError("inference bundle is empty")
 
-    _, output_chunk = _resolve_chunk_lengths(forecast_date)
+    input_chunk, output_chunk = _resolve_chunk_lengths(forecast_date)
 
     banner(
         f"PREDICT TFT {forecast_date.upper()}  n_series={bundle.n_series}  "
@@ -564,10 +564,27 @@ def predict_tft(
         logger=logger,
     )
 
+    # Darts predicts ``n`` steps **after the end** of each input series. Our
+    # bundle stores full-season series (Apr 1 -> Nov 30); feeding them whole
+    # would ask the decoder for Dec 1 -> Mar 31 of the *next* year and trip
+    # the "future_covariates do not extend far enough" check. Truncate each
+    # target to ``input_chunk_length`` so the decoder lands inside the same
+    # growing season:
+    #   aug1  : last input = Jul 31  -> output covers Aug 1 -> Nov 30 (122d)
+    #   sep1  : last input = Aug 31  -> output covers Sep 1 -> Nov 30  (91d)
+    #   oct1  : last input = Sep 30  -> output covers Oct 1 -> Nov 30  (61d)
+    #   final : last input = Nov 29  -> output covers Nov 30           (1d)
+    truncated_targets = []
+    for ts in bundle.target_series:
+        if len(ts) <= input_chunk:
+            truncated_targets.append(ts)
+        else:
+            truncated_targets.append(ts[:input_chunk])
+
     t0 = time.monotonic()
     predict_kwargs: dict = {
         "n": output_chunk,
-        "series": bundle.target_series,
+        "series": truncated_targets,
         "past_covariates": bundle.past_covariates,
         "future_covariates": bundle.future_covariates,
         "num_samples": num_samples,
