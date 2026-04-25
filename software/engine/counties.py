@@ -120,12 +120,13 @@ def _resolve_states(states: Iterable[str] | None) -> list[str]:
     return [f for f in out if not (f in seen or seen.add(f))]
 
 
-def _build_lookup() -> gpd.GeoDataFrame:
+def _build_lookup(force_download: bool = False) -> gpd.GeoDataFrame:
     """Parse the cached TIGER shapefile and normalize to the project schema."""
-    zip_path = _download_tiger()
+    zip_path = _download_tiger(force=force_download)
 
     # geopandas can read a shapefile straight out of a zip via fiona/pyogrio.
-    raw = gpd.read_file(f"zip://{zip_path}")
+    # `as_posix()` keeps the URI valid on Windows, where str(Path) uses backslashes.
+    raw = gpd.read_file(f"zip://{zip_path.as_posix()}")
 
     # Filter to our 5 states *before* doing any other work.
     raw = raw[raw["STATEFP"].isin(TARGET_STATES)].copy()
@@ -174,7 +175,8 @@ def load_counties(
     """
     parquet = _parquet_path()
     if refresh or not parquet.exists():
-        gdf = _build_lookup()
+        # SPEC §4: refresh=True rebuilds *both* cache layers (zip and parquet).
+        gdf = _build_lookup(force_download=refresh)
         # GeoParquet so geometry round-trips losslessly.
         gdf.to_parquet(parquet, index=False)
     else:
