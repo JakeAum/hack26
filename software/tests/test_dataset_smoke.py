@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 from engine.dataset import (
+    BUNDLE_META_VERSION,
     DEFAULT_SEASON_END_DOY,
     DEFAULT_SEASON_START_DOY,
     FUTURE_COVARIATE_COLS,
@@ -29,6 +30,10 @@ from engine.dataset import (
     _historical_mean_yields,
     _impute_past_block,
     _validate_train_year_range,
+    load_training_bundle,
+    load_training_bundle_meta,
+    save_training_bundle,
+    training_bundle_fits_train_request,
 )
 
 
@@ -238,6 +243,83 @@ def test_filter_by_year_lockstep() -> None:
     # past_cov_cols / static_cols are *copied*, not shared references
     assert sub.past_covariate_cols == ["PRECTOTCORR", "T2M"]
     assert sub.past_covariate_cols is not bundle.past_covariate_cols
+
+
+# ---------------------------------------------------------------------------
+# On-disk training bundle (hack26-dataset → hack26-train)
+# ---------------------------------------------------------------------------
+
+def _sample_meta() -> dict:
+    return {
+        "bundle_meta_version": BUNDLE_META_VERSION,
+        "states_fips": ["19"],
+        "start_year": 2008,
+        "end_year": 2024,
+        "include_sentinel": False,
+        "include_smap": True,
+        "season_start_doy": DEFAULT_SEASON_START_DOY,
+        "season_end_doy": DEFAULT_SEASON_END_DOY,
+    }
+
+
+def test_training_bundle_fits_train_request_ok() -> None:
+    """Cached bundle years/states must cover the train/val/test split."""
+    idx = pd.DataFrame({
+        "year": [2020, 2021, 2022, 2023, 2024],
+        "state_fips": ["19"] * 5,
+    })
+    bundle = TrainingBundle(series_index=idx)
+    ok, err = training_bundle_fits_train_request(
+        bundle,
+        _sample_meta(),
+        states_fips=["19"],
+        required_years={2020, 2023, 2024},
+        include_sentinel=False,
+        include_smap=True,
+    )
+    assert ok and err == ""
+
+
+def test_training_bundle_fits_train_request_rejects_missing_year() -> None:
+    idx = pd.DataFrame({
+        "year": [2020, 2021, 2022],
+        "state_fips": ["19", "19", "19"],
+    })
+    bundle = TrainingBundle(series_index=idx)
+    ok, err = training_bundle_fits_train_request(
+        bundle,
+        _sample_meta(),
+        states_fips=["19"],
+        required_years={2023},
+        include_sentinel=False,
+        include_smap=True,
+    )
+    assert not ok
+    assert "missing year" in err
+
+
+def test_save_load_training_bundle_roundtrip(tmp_path) -> None:
+    idx = pd.DataFrame({"year": [2022], "state_fips": ["19"]})
+    bundle = TrainingBundle(
+        target_series=[],
+        past_covariates=[],
+        future_covariates=[],
+        series_index=idx,
+    )
+    p = tmp_path / "b.pkl"
+    save_training_bundle(
+        bundle,
+        p,
+        states_fips=["19"],
+        start_year=2018,
+        end_year=2022,
+        include_sentinel=False,
+        include_smap=True,
+    )
+    assert load_training_bundle_meta(p) is not None
+    out = load_training_bundle(p)
+    assert out.n_series == 0
+    assert out.series_index["year"].tolist() == [2022]
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,9 @@ Public surface:
     TrainingBundle         dataclass — target/past/future series + statics
     build_training_dataset(states, start_year, end_year, ...) -> TrainingBundle
     build_inference_dataset(states, target_year, ...)         -> TrainingBundle
+    save_training_bundle / load_training_bundle — pickle the bundle for
+        ``hack26-train`` to reuse (avoids re-pulling weather/CDL for every run)
+    default_last_training_bundle_path — canonical path for ``--save-last-bundle``
     _main(argv)            CLI:  python -m engine.dataset --dump-stats ...
 
 Hard rule (enforced in code): ``end_year`` may not exceed
@@ -40,11 +43,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
+import pickle
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -203,6 +209,170 @@ class TrainingBundle:
             past_covariate_cols=list(self.past_covariate_cols),
             static_covariate_cols=list(self.static_covariate_cols),
         )
+
+
+# ---------------------------------------------------------------------------
+# Training bundle on-disk cache (for hack26-dataset → hack26-train)
+# ---------------------------------------------------------------------------
+
+BUNDLE_META_VERSION: int = 1
+LAST_BUNDLE_PKL: str = "last_training_bundle.pkl"
+LAST_BUNDLE_META: str = "last_training_bundle.meta.json"
+
+
+def _bundles_dir() -> Path:
+    """``<data_root>/derived/bundles/`` — same data root as weather/NASS."""
+    from engine.nass._cache import data_root
+
+    d = data_root() / "derived" / "bundles"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def default_last_training_bundle_path() -> Path:
+    """Default pickle path written by ``hack26-dataset --save-last-bundle``."""
+    return _bundles_dir() / LAST_BUNDLE_PKL
+
+
+def default_last_training_bundle_meta_path() -> Path:
+    return _bundles_dir() / LAST_BUNDLE_META
+
+
+def _meta_path_for_pickle(pkl: Path) -> Path:
+    """Sidecar JSON next to the pickle (e.g. ``foo.pkl`` → ``foo.meta.json``)."""
+    return pkl.with_name(pkl.stem + ".meta.json")
+
+
+def save_training_bundle(
+    bundle: TrainingBundle,
+    pkl_path: Path,
+    *,
+    states_fips: Sequence[str],
+    start_year: int,
+    end_year: int,
+    include_sentinel: bool,
+    include_smap: bool,
+    season_start_doy: int = DEFAULT_SEASON_START_DOY,
+    season_end_doy: int = DEFAULT_SEASON_END_DOY,
+    require_label: bool = True,
+    min_coverage_frac: float = 0.95,
+) -> Path:
+    """Pickle a :class:`TrainingBundle` + write JSON metadata for train-time checks.
+
+    **Security:** Only :func:`load_training_bundle` pickles you created; never
+    load untrusted files.
+
+    Returns:
+        ``pkl_path`` (written).
+    """
+    pkl_path = Path(pkl_path)
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    meta: dict[str, Any] = {
+        "bundle_meta_version": BUNDLE_META_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "states_fips": sorted({str(f).zfill(2) for f in states_fips}),
+        "start_year": int(start_year),
+        "end_year": int(end_year),
+        "include_sentinel": bool(include_sentinel),
+        "include_smap": bool(include_smap),
+        "season_start_doy": int(season_start_doy),
+        "season_end_doy": int(season_end_doy),
+        "require_label": bool(require_label),
+        "min_coverage_frac": float(min_coverage_frac),
+    }
+    meta_path = _meta_path_for_pickle(pkl_path)
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+    with pkl_path.open("wb") as f:
+        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return pkl_path
+
+
+def load_training_bundle(pkl_path: Path) -> TrainingBundle:
+    """Load a bundle saved with :func:`save_training_bundle`."""
+    with Path(pkl_path).open("rb") as f:
+        obj = pickle.load(f)
+    if not isinstance(obj, TrainingBundle):
+        raise TypeError(f"expected TrainingBundle, got {type(obj).__name__}")
+    return obj
+
+
+def load_training_bundle_meta(pkl_path: Path) -> dict[str, Any] | None:
+    """Return metadata dict if the sidecar exists, else ``None``."""
+    mp = _meta_path_for_pickle(Path(pkl_path))
+    if not mp.is_file():
+        return None
+    with mp.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def training_bundle_fits_train_request(
+    bundle: TrainingBundle,
+    meta: dict[str, Any] | None,
+    *,
+    states_fips: list[str],
+    required_years: set[int],
+    include_sentinel: bool,
+    include_smap: bool,
+    season_start_doy: int = DEFAULT_SEASON_START_DOY,
+    season_end_doy: int = DEFAULT_SEASON_END_DOY,
+) -> tuple[bool, str]:
+    """Return (True, \"\") if a cached bundle matches the training CLI request.
+
+    ``required_years`` is typically ``train_years ∪ {val, test}`` clipped to
+    :data:`MAX_TRAIN_YEAR`. Every required year must appear at least once in
+    ``bundle.series_index['year']``. State lists (sorted FIPS) must match.
+    """
+    want_states = sorted({str(f).zfill(2) for f in states_fips})
+    if meta is not None:
+        if int(meta.get("bundle_meta_version", 0)) != BUNDLE_META_VERSION:
+            return False, f"meta version mismatch (got {meta.get('bundle_meta_version')!r})"
+        meta_states = list(meta.get("states_fips") or [])
+        if sorted(str(x).zfill(2) for x in meta_states) != want_states:
+            return (
+                False,
+                f"states mismatch: cache has {meta_states!r}, train needs {want_states!r}",
+            )
+        if bool(meta.get("include_sentinel")) != include_sentinel:
+            return False, "include_sentinel mismatch"
+        if bool(meta.get("include_smap")) != include_smap:
+            return False, "include_smap mismatch"
+        if int(meta.get("season_start_doy", -1)) != int(season_start_doy):
+            return False, "season_start_doy mismatch"
+        if int(meta.get("season_end_doy", -1)) != int(season_end_doy):
+            return False, "season_end_doy mismatch"
+    else:
+        g = bundle.series_index
+        if g.empty or "state_fips" not in g.columns:
+            return False, "no meta.json and series_index is unusable"
+        have = sorted(
+            {str(s).zfill(2) for s in g["state_fips"].astype(str).unique().tolist()}
+        )
+        if have != want_states:
+            return False, f"states in bundle {have!r} != train {want_states!r}"
+
+    if bundle.series_index.empty:
+        return False, "empty bundle"
+
+    have_years = set(bundle.series_index["year"].astype(int).tolist())
+    miss = set(required_years) - have_years
+    if miss:
+        return (
+            False,
+            f"cached bundle missing year(s): {sorted(miss)} (have {min(have_years)}..{max(have_years)})",
+        )
+    if meta is not None:
+        if int(meta["start_year"]) > min(required_years):
+            return (
+                False,
+                f"cache start_year {meta['start_year']} > min required {min(required_years)}",
+            )
+        if int(meta["end_year"]) < max(required_years):
+            return (
+                False,
+                f"cache end_year {meta['end_year']} < max required {max(required_years)}",
+            )
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1211,21 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-stats", type=Path, default=None,
                         help="Optional: write the series_index dataframe to a "
                              "parquet/CSV for inspection.")
+    parser.add_argument(
+        "--save-last-bundle",
+        action="store_true",
+        help="After a training build, save the Darts TrainingBundle to "
+             "<data_root>/derived/bundles/last_training_bundle.pkl (+ .meta.json). "
+             "hack26-train reuses this by default to skip re-pulling weather/CDL.",
+    )
+    parser.add_argument(
+        "--save-bundle",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Save the training bundle to PATH.pkl with PATH.meta.json. "
+             "Takes precedence over --save-last-bundle if both are set.",
+    )
     add_cli_logging_args(parser)
     args = parser.parse_args(argv)
 
@@ -1088,6 +1273,32 @@ def _main(argv: list[str] | None = None) -> int:
                          "(use .parquet or .csv)", suf)
             return 2
         logger.info("wrote series-index summary to %s", args.out_stats)
+
+    save_pkl: Path | None = args.save_bundle
+    if save_pkl is None and args.save_last_bundle:
+        save_pkl = default_last_training_bundle_path()
+    if save_pkl is not None and args.inference_year is not None:
+        logger.warning(
+            "--save-bundle / --save-last-bundle only apply to training builds; "
+            "inference build — skipping bundle save"
+        )
+        save_pkl = None
+
+    if save_pkl is not None:
+        from engine.counties import _resolve_states
+
+        fips = _resolve_states(args.states)
+        save_training_bundle(
+            bundle,
+            save_pkl,
+            states_fips=fips,
+            start_year=int(args.start),
+            end_year=int(args.end),
+            include_sentinel=args.include_sentinel,
+            include_smap=not args.no_smap,
+        )
+        logger.info("wrote training bundle: %s", save_pkl)
+        logger.info("wrote bundle metadata:  %s", _meta_path_for_pickle(save_pkl))
     return 0
 
 

@@ -51,6 +51,10 @@ from .dataset import (
     MIN_TRAIN_YEAR,
     TrainingBundle,
     build_training_dataset,
+    default_last_training_bundle_path,
+    load_training_bundle,
+    load_training_bundle_meta,
+    training_bundle_fits_train_request,
 )
 
 if TYPE_CHECKING:
@@ -786,6 +790,21 @@ def _main(argv: list[str] | None = None) -> int:
                              "this flag missing CDL years are skipped (the "
                              "static covariates fall back to the nearest "
                              "available year).")
+    parser.add_argument(
+        "--dataset-bundle",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Load a pickled TrainingBundle from PATH (from hack26-dataset "
+             "--save-bundle). If omitted, tries the last bundle from "
+             "hack26-dataset --save-last-bundle when present and compatible.",
+    )
+    parser.add_argument(
+        "--rebuild-dataset",
+        action="store_true",
+        help="Ignore any on-disk training bundle and re-run the full "
+             "weather/CDL/NASS pull (same as needing a fresh build).",
+    )
     add_cli_logging_args(parser)
     args = parser.parse_args(argv)
 
@@ -817,15 +836,68 @@ def _main(argv: list[str] | None = None) -> int:
     end_year = max([*train_years, val_year or 0, test_year or 0])
     logger.info("dataset will pull years %d-%d", MIN_TRAIN_YEAR, end_year)
 
-    bundle = build_training_dataset(
-        states=args.states,
-        start_year=MIN_TRAIN_YEAR,
-        end_year=end_year,
-        include_sentinel=args.include_sentinel,
-        include_smap=not args.no_smap,
-        refresh=args.refresh,
-        allow_download=args.allow_download,
+    required_years = {int(y) for y in train_years}
+    if val_year is not None:
+        required_years.add(int(val_year))
+    if test_year is not None:
+        required_years.add(int(test_year))
+    required_years = {y for y in required_years if y <= MAX_TRAIN_YEAR}
+
+    from engine.counties import _resolve_states
+
+    resolved_states = _resolve_states(args.states)
+
+    bundle: TrainingBundle | None = None
+    try_cache = (
+        not args.refresh
+        and not args.rebuild_dataset
     )
+    candidate: Path | None = None
+    if try_cache:
+        if args.dataset_bundle is not None:
+            candidate = Path(args.dataset_bundle)
+        else:
+            candidate = default_last_training_bundle_path()
+
+    if try_cache and candidate is not None and candidate.is_file():
+        try:
+            meta = load_training_bundle_meta(candidate)
+            loaded = load_training_bundle(candidate)
+            ok, reason = training_bundle_fits_train_request(
+                loaded,
+                meta,
+                states_fips=resolved_states,
+                required_years=required_years,
+                include_sentinel=args.include_sentinel,
+                include_smap=not args.no_smap,
+            )
+            if ok:
+                bundle = loaded
+                logger.info(
+                    "using cached training bundle from %s (n_series=%d)",
+                    candidate, bundle.n_series,
+                )
+            else:
+                logger.warning(
+                    "cached training bundle incompatible: %s — rebuilding from sources",
+                    reason,
+                )
+        except Exception as exc:  # noqa: BLE001 - log and rebuild
+            logger.warning(
+                "could not load training bundle from %s (%s) — rebuilding from sources",
+                candidate, exc,
+            )
+
+    if bundle is None:
+        bundle = build_training_dataset(
+            states=args.states,
+            start_year=MIN_TRAIN_YEAR,
+            end_year=end_year,
+            include_sentinel=args.include_sentinel,
+            include_smap=not args.no_smap,
+            refresh=args.refresh,
+            allow_download=args.allow_download,
+        )
     logger.info("[2025-leak-guard] year_split: train=%s val=%s test=%s; "
                 "2025_in_data=%s",
                 train_years, val_year, test_year,

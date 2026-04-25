@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Sequence
 
 import pandas as pd
@@ -299,15 +300,60 @@ def fetch_counties_power(
     refresh: bool = False,
     sleep_between: float = 1.0,
     progress_every: int = 25,
+    max_workers: int = 1,
 ) -> pd.DataFrame:
     """Loop :func:`fetch_county_power` over every row in a county GeoDataFrame.
 
     ``sleep_between`` keeps us polite to NASA POWER (no documented rate limit
     but the original script used 1 s; cached counties skip the sleep entirely).
+    When ``max_workers`` > 1, counties are fetched concurrently (I/O bound);
+    ``sleep_between`` is not applied in that mode — concurrency caps load on NASA.
     """
-    frames: list[pd.DataFrame] = []
-    n = len(counties)
-    for i, (_, row) in enumerate(counties.iterrows(), start=1):
+    rows = list(counties.iterrows())
+    n = len(rows)
+    if n == 0:
+        return pd.DataFrame(index=pd.MultiIndex.from_arrays(
+            [[], []], names=["date", "geoid"]
+        ))
+
+    if max_workers > 1:
+        def _one(entry: tuple[int, tuple]) -> tuple[int, pd.DataFrame | None]:
+            j, (_, row) = entry
+            geoid = str(row["geoid"])
+            try:
+                df = fetch_county_power(
+                    geoid=geoid,
+                    geometry=row.geometry,
+                    start_year=start_year,
+                    end_year=end_year,
+                    parameters=parameters,
+                    county_row=row,
+                    refresh=refresh,
+                )
+                return (j, df)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warning(
+                    "[weather.power] POWER failed for geoid=%s: %s",
+                    geoid, exc,
+                )
+                return (j, None)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            # map preserves input order
+            out = list(ex.map(_one, list(enumerate(rows))))
+        frames = [f for _, f in out if f is not None]
+        _LOG.info(
+            "[weather.power] %d/%d counties processed (max_workers=%d)",
+            len(frames), n, max_workers,
+        )
+        if not frames:
+            return pd.DataFrame(index=pd.MultiIndex.from_arrays(
+                [[], []], names=["date", "geoid"]
+            ))
+        return pd.concat(frames).sort_index()
+
+    frames = []
+    for i, (_, row) in enumerate(rows, start=1):
         geoid = str(row["geoid"])
         cache = power_cache_path(geoid, start_year, end_year)
         had_cache = cache.exists() and not refresh
@@ -346,6 +392,7 @@ def fetch_counties_smap(
     refresh: bool = False,
     sleep_between: float = 1.0,
     progress_every: int = 25,
+    max_workers: int = 1,
 ) -> pd.DataFrame:
     """Vectorized SMAP — same pattern as :func:`fetch_counties_power`.
 
@@ -355,10 +402,50 @@ def fetch_counties_smap(
     return value is still a properly-typed (possibly empty) DataFrame so
     downstream merges don't blow up.
     """
-    frames: list[pd.DataFrame] = []
-    n = len(counties)
+    rows = list(counties.iterrows())
+    n = len(rows)
+    if n == 0:
+        return pd.DataFrame(index=pd.MultiIndex.from_arrays(
+            [[], []], names=["date", "geoid"]
+        ))
+
+    if max_workers > 1:
+        def _one(entry: tuple[int, tuple]) -> pd.DataFrame | None:
+            _, (_, row) = entry
+            geoid = str(row["geoid"])
+            return fetch_county_smap(
+                geoid=geoid,
+                geometry=row.geometry,
+                start_year=start_year,
+                end_year=end_year,
+                county_row=row,
+                refresh=refresh,
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            dlist = list(ex.map(_one, list(enumerate(rows))))
+        frames = [df for df in dlist if not df.empty]
+        if _SMAP_BROKEN_THIS_PROCESS:
+            _LOG.warning(
+                "SMAP unavailable this run (POWER rejected SMLAND); "
+                "continuing without SMAP — model still trains. "
+                "(parallel fetch, max_workers=%d)",
+                max_workers,
+            )
+        else:
+            _LOG.info(
+                "[weather.power] SMAP %d/%d counties with data (max_workers=%d)",
+                len(frames), n, max_workers,
+            )
+        if not frames:
+            return pd.DataFrame(index=pd.MultiIndex.from_arrays(
+                [[], []], names=["date", "geoid"]
+            ))
+        return pd.concat(frames).sort_index()
+
+    frames = []
     n_short_circuited = 0
-    for i, (_, row) in enumerate(counties.iterrows(), start=1):
+    for i, (_, row) in enumerate(rows, start=1):
         geoid = str(row["geoid"])
         cache = smap_cache_path(geoid, max(start_year, SMAP_FIRST_YEAR), end_year)
         had_cache = cache.exists() and not refresh
