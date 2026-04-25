@@ -171,12 +171,11 @@ row = fetch_county_cdl(geoid="19169", geometry=poly,       # single-county form
 
 `load_cdl(year, resolution)` validates the (year, resolution) combo against the matrix above and raises `ValueError` for unsupported pairs (e.g. 2019 at 10 m).
 
-**Data discovery.** `load_cdl` probes these locations *in order* before triggering a download. This is how the AWS sagemaker workshop machine reuses its pre-extracted 14.9 GB EFS copy instead of pulling another 9.8 GB:
+**Data discovery (strict mode).** `load_cdl` resolves a single data root and refuses to fall back anywhere else. The engine never silently triggers a multi-GB download from a hot path:
 
-1. `$HACK26_CDL_DATA_DIR/{year}_{res}m_cdls.tif` — explicit env override.
-2. `~/hack26/data/{year}_{res}m_cdls.tif` — the documented EFS mount per the README.
-3. `~/.hack26/cdl/{year}_{res}m_cdls.tif` — our own download cache.
-4. Download zip → extract → step 3.
+1. **Data root** = `$HACK26_CDL_DATA_DIR` if set, else `~/hack26/data`. If the directory itself is missing, `load_cdl` raises `FileNotFoundError` immediately so the operator sees "EFS not mounted" instead of a 9.8 GB pull.
+2. **Raster lookup** = `<data_root>/{year}_{res}m_cdls.tif`. If absent, `load_cdl` raises `FileNotFoundError` (no `~/.hack26` fallback). Pass `allow_download=True` (or the CLI flag `--allow-download` / `--download-only`) to opt-in to fetching from the workshop S3 mirror or NASS HTTPS into the data root.
+3. **Per-county cache** = `<data_root>/derived/county_features_*.parquet` — written next to the rasters, never under `~/.hack26`.
 
 **Call flow.**
 
@@ -184,48 +183,47 @@ row = fetch_county_cdl(geoid="19169", geometry=poly,       # single-county form
 sequenceDiagram
     participant Caller as Caller (CLI / Engine)
     participant CDL as load_cdl()
-    participant EFS as EFS mount<br/>(~/hack26/data)
-    participant Cache as Local cache<br/>(~/.hack26/cdl/)
+    participant Root as Data root<br/>($HACK26_CDL_DATA_DIR<br/>or ~/hack26/data)
     participant S3 as Workshop S3<br/>(2025 10 m only)
     participant NASS as NASS HTTPS<br/>(2008-2025)
 
     Caller->>CDL: load_cdl(year, resolution)
-    CDL->>EFS: {year}_{res}m_cdls.tif present?
-    alt EFS hit
-        EFS-->>Caller: Path (no I/O)
-    else EFS miss
-        CDL->>Cache: extracted .tif present?
-        alt cache hit
-            Cache-->>Caller: Path
-        else cache miss
-            CDL->>Cache: zip present?
-            alt zip miss
-                alt year=2025, res=10, aws CLI present
-                    CDL->>S3: anonymous GET
-                    S3-->>Cache: zip
-                else
-                    CDL->>NASS: GET
-                    NASS-->>Cache: zip
-                end
+    CDL->>Root: directory exists?
+    alt root missing
+        CDL-->>Caller: FileNotFoundError ("EFS not mounted")
+    else root present
+        CDL->>Root: {year}_{res}m_cdls.tif present?
+        alt raster hit
+            Root-->>Caller: Path (no I/O)
+        else raster missing AND allow_download=False
+            CDL-->>Caller: FileNotFoundError ("pre-stage or pass allow_download")
+        else raster missing AND allow_download=True
+            alt year=2025, res=10, aws CLI, source in {auto, workshop}
+                CDL->>S3: anonymous GET
+                S3-->>Root: zip
+            else
+                CDL->>NASS: GET
+                NASS-->>Root: zip
             end
-            CDL->>Cache: extract .tif (+ .ovr / .aux sidecars)
-            Cache-->>Caller: Path
+            CDL->>Root: extract .tif (+ .ovr / .aux sidecars)
+            Root-->>Caller: Path
         end
     end
 ```
 
-`fetch_counties_cdl` opens the national raster once, reprojects each county polygon from EPSG:4269 (NAD83) to the CDL's CONUS Albers CRS via `rasterio.warp.transform_geom`, and runs `rasterio.mask` per county to get a 256-bin pixel-class histogram. The output frame is cached as `~/.hack26/cdl/county_features_{year}_{res}m_{nrows}_{geoid_hash}.parquet` (the hash is a 12-char SHA-1 prefix over the sorted `geoid` list, so different county sets of the same size — e.g. 5 Iowa counties vs 5 Colorado counties — never share a cache file) so a repeat call with the same county set is a sub-second parquet read.
+`fetch_counties_cdl` opens the national raster once, reprojects each county polygon from EPSG:4269 (NAD83) to the CDL's CONUS Albers CRS via `rasterio.warp.transform_geom`, and runs `rasterio.mask` per county to get a 256-bin pixel-class histogram. The output frame is cached as `<data_root>/derived/county_features_{year}_{res}m_{nrows}_{geoid_hash}.parquet` (the hash is a 12-char SHA-1 prefix over the sorted `geoid` list, so different county sets of the same size — e.g. 5 Iowa counties vs 5 Colorado counties — never share a cache file) so a repeat call with the same county set is a sub-second parquet read.
 
-**Cache layout.**
+**On-disk layout (data root, e.g. `~/hack26/data/`).**
 ```
-~/.hack26/cdl/
-├── 2025_10m_cdls.zip                   # raw NASS / workshop download (only if EFS missed)
-├── 2025_10m_cdls.tif                   # extracted national raster
+~/hack26/data/
+├── 2025_10m_cdls.tif                   # pre-staged national raster (EFS or downloaded)
 ├── 2025_10m_cdls.tif.ovr               # overview pyramid sidecar
-└── county_features_2025_10m_99_3f7a9c1b2e4d.parquet # per-county aggregation (Iowa example; suffix is sha1(sorted geoids)[:12])
+├── 2025_10m_cdls.zip                   # only present if --allow-download / --download-only ran
+└── derived/
+    └── county_features_2025_10m_99_3f7a9c1b2e4d.parquet # per-county aggregation; suffix is sha1(sorted geoids)[:12]
 ```
 
-`refresh=True` only ever clobbers files in `~/.hack26/cdl/`. Pre-mounted EFS rasters at `~/hack26/data/` are treated read-only.
+`refresh=True` clobbers our own outputs (the zip and extracted raster, plus forces re-aggregation of the parquet); pre-mounted EFS rasters can be safely re-loaded from a fresh download by combining `--refresh --allow-download`. The engine never writes to `~/.hack26/`.
 
 **Non-goals.**
 - No raster reprojection — we always warp the county polygon to CDL Albers, never the other way around (a national 10 m reproject would be a tens-of-GB operation per call).
@@ -251,9 +249,8 @@ hack26/
 ```
 
 Local caches (gitignored, live outside the repo):
-- `~/.hack26/tiger/` — TIGER zip + 5-state GeoParquet.
-- `~/.hack26/cdl/` — CDL zips, extracted GeoTIFFs, per-county feature parquets.
-- `~/hack26/data/` — read-only EFS mount on the AWS workshop machine; pre-extracted national CDL rasters live here.
+- `~/.hack26/tiger/` — TIGER zip + 5-state GeoParquet (county catalog only).
+- `~/hack26/data/` — single source of truth for CDL. Pre-extracted national rasters live here on the AWS workshop machine; `derived/` holds our per-county feature parquets. The CDL engine never writes to `~/.hack26/`.
 
 ## 7. Operations
 
@@ -298,14 +295,15 @@ Intended to run on the AWS sagemaker workshop instance — the 14.9 GB 2025 10 m
 
 Module form:
 ```bash
-python -m engine.cdl                                    # 2025, 30 m, all 5 states
+python -m engine.cdl                                    # 2025, 30 m, all 5 states (raster MUST be pre-staged)
 python -m engine.cdl --year 2024 --resolution 30        # any historical year (2008-2025 @ 30 m)
-python -m engine.cdl --year 2025 --resolution 10        # uses EFS .tif if present, else downloads
+python -m engine.cdl --year 2025 --resolution 10        # 10 m: requires EFS .tif at ~/hack26/data/
 python -m engine.cdl --states Iowa Colorado             # subset
-python -m engine.cdl --refresh                          # re-download zip + re-aggregate
-python -m engine.cdl --download-only                    # fetch + extract only, skip masking
-python -m engine.cdl --source nass                      # force NASS HTTPS (default is auto)
-python -m engine.cdl --source workshop                  # force s3://rayette.guru (2025 10 m only)
+python -m engine.cdl --allow-download                   # opt-in: fetch from NASS / workshop S3 if missing
+python -m engine.cdl --refresh --allow-download         # re-download + re-extract + re-aggregate
+python -m engine.cdl --download-only                    # fetch + extract only, skip masking (implies --allow-download)
+python -m engine.cdl --source nass --allow-download     # force NASS HTTPS (default is auto)
+python -m engine.cdl --source workshop --allow-download # force s3://rayette.guru (2025 10 m only)
 python -m engine.cdl --out cdl_features.parquet         # also export (.parquet or .csv)
 ```
 
@@ -314,7 +312,9 @@ Console-script form (after editable install):
 hack26-cdl --year 2025 --resolution 10 --states Iowa
 ```
 
-Expected runtime on the AWS box (2025 10 m, all 5 states / 443 counties): ~minutes for the first cold pass; sub-second for cached re-reads (parquet at `~/.hack26/cdl/county_features_2025_10m_443_<hash>.parquet`).
+**Strict mode.** Without `--allow-download`, a missing raster raises `FileNotFoundError` instead of pulling 9.8 GB from a hot path. Likewise, if the data root itself (`~/hack26/data` or `$HACK26_CDL_DATA_DIR`) doesn't exist, every CDL entry point errors out immediately so an unmounted EFS volume is loud, not silent.
+
+Expected runtime on the AWS box (2025 10 m, all 5 states / 443 counties): ~minutes for the first cold pass; sub-second for cached re-reads (parquet at `~/hack26/data/derived/county_features_2025_10m_443_<hash>.parquet`).
 
 ### 7.4 Tests
 
@@ -348,19 +348,25 @@ TIGER (county catalog):
 .venv\Scripts\python.exe -m engine.counties --refresh
 ```
 
-CDL (only files in `~/.hack26/cdl/` — pre-mounted EFS rasters at `~/hack26/data/` are read-only and ignored):
+CDL — only ever touches files inside the data root (default `~/hack26/data/`). The per-county parquet under `derived/` always re-runs; the raster itself only re-downloads when you also pass `--allow-download`:
 ```bash
-python -m engine.cdl --year 2025 --resolution 30 --refresh
+python -m engine.cdl --year 2025 --resolution 30 --refresh                   # re-aggregate from existing raster
+python -m engine.cdl --year 2025 --resolution 30 --refresh --allow-download  # re-pull + re-aggregate
 ```
 
-Or, to start fully clean:
+Or, to start fully clean (TIGER + Iowa GeoParquet only — does NOT touch the CDL data root):
 ```powershell
 Remove-Item -Recurse -Force $HOME\.hack26
+```
+
+To wipe CDL outputs (keep the rasters, drop the derived parquets):
+```bash
+rm -rf ~/hack26/data/derived/
 ```
 
 ### 7.7 Environment variables
 
 | Var                  | Default              | Effect                                                        |
 | -------------------- | -------------------- | ------------------------------------------------------------- |
-| `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for all source caches. `tiger/` and `cdl/` subdirs created underneath. |
-| `HACK26_CDL_DATA_DIR`| *(unset)*            | First location probed for an already-extracted CDL `{year}_{res}m_cdls.tif`. Use this on the AWS box to point at a non-default EFS mount. Falls back to `~/hack26/data/` then `$HACK26_CACHE_DIR/cdl/`. |
+| `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for the County Catalog (TIGER) cache only. Not used by the CDL engine. |
+| `HACK26_CDL_DATA_DIR`| `~/hack26/data`      | **CDL data root.** Single source of truth for rasters AND derived parquet outputs. Must already exist — the CDL engine raises `FileNotFoundError` instead of falling back anywhere else. |

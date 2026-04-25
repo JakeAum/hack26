@@ -81,32 +81,43 @@ NONCROPLAND_CLASSES = frozenset(
 # Cache + data discovery
 # ---------------------------------------------------------------------------
 
-def _cache_dir() -> Path:
-    """Where downloaded zips and our own extractions live."""
-    root = Path(os.environ.get("HACK26_CACHE_DIR", Path.home() / ".hack26"))
-    d = root / "cdl"
+def _data_root() -> Path:
+    """The single source of truth for CDL data.
+
+    Resolves to ``$HACK26_CDL_DATA_DIR`` if set, else ``~/hack26/data``. The
+    directory MUST exist — engine code refuses to fall back to ``~/.hack26``
+    or trigger a multi-GB download on the AWS workshop box. If it doesn't
+    exist, raise ``FileNotFoundError`` so the operator knows the EFS mount
+    is missing instead of quietly burning bandwidth.
+    """
+    env = os.environ.get("HACK26_CDL_DATA_DIR")
+    root = Path(env) if env else Path.home() / "hack26" / "data"
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"CDL data root not found: {root}\n"
+            f"Engine refuses to fall back to ~/.hack26 or download "
+            f"multi-GB rasters at runtime.\n"
+            f"Fix: mount the EFS data dir at ~/hack26/data, or set "
+            f"HACK26_CDL_DATA_DIR=/path/to/data."
+        )
+    return root
+
+
+def _derived_dir() -> Path:
+    """Writable subdir of the data root for our per-county parquet outputs.
+
+    Lives under the same root as the rasters (``~/hack26/data/derived/``) so
+    we never touch ``~/.hack26``. Auto-created on first use.
+    """
+    d = _data_root() / "derived"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _data_dirs() -> list[Path]:
-    """Read-only locations to probe for a pre-extracted national CDL .tif.
-
-    Ordered by preference: explicit env override > documented EFS mount > our
-    own download cache. Returning a list (not a single dir) so the discovery
-    rules stay declarative and easy to extend.
-    """
-    out: list[Path] = []
-    env = os.environ.get("HACK26_CDL_DATA_DIR")
-    if env:
-        out.append(Path(env))
-    out.append(Path.home() / "hack26" / "data")
-    out.append(_cache_dir())
-    return out
-
-
 def _zip_path(year: int, resolution: int) -> Path:
-    return _cache_dir() / f"{year}_{resolution}m_cdls.zip"
+    """Where ``--download-only`` writes a freshly-pulled zip — under the EFS
+    data root, not ``~/.hack26``."""
+    return _data_root() / f"{year}_{resolution}m_cdls.zip"
 
 
 def _tif_basename(year: int, resolution: int) -> str:
@@ -129,13 +140,14 @@ def _validate(year: int, resolution: int) -> None:
 
 
 def _find_existing_tif(year: int, resolution: int) -> Path | None:
-    """First .tif that already exists on disk, or None."""
-    name = _tif_basename(year, resolution)
-    for d in _data_dirs():
-        candidate = d / name
-        if candidate.exists():
-            return candidate
-    return None
+    """Return the .tif under the data root if it exists, else ``None``.
+
+    Single-location lookup — no fallback chain. The data root itself is
+    validated by ``_data_root()``; this only reports whether the requested
+    (year, resolution) raster has been pre-staged inside it.
+    """
+    candidate = _data_root() / _tif_basename(year, resolution)
+    return candidate if candidate.exists() else None
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +223,12 @@ def _download_zip(year: int, resolution: int, source: str = "auto") -> Path:
 
 def _extract_tif(zip_path: Path, year: int, resolution: int) -> Path:
     """Extract the .tif (and any sidecars: .tif.ovr, .tif.aux.xml, .tfw) into
-    the cache dir. Returns the path to the .tif. Idempotent.
+    the data root. Returns the path to the .tif. Idempotent.
 
     We extract sidecars too because rasterio uses .ovr for fast overview reads
     and we don't want it silently regenerating multi-GB pyramids on first open.
     """
-    out_dir = _cache_dir()
+    out_dir = _data_root()
     tif_path = out_dir / _tif_basename(year, resolution)
     if tif_path.exists():
         return tif_path
@@ -256,27 +268,41 @@ def load_cdl(
     resolution: int = 30,
     refresh: bool = False,
     source: str = "auto",
+    allow_download: bool = False,
 ) -> Path:
     """Return a path to the national CDL GeoTIFF for ``year`` at ``resolution`` m.
 
-    Discovery order: env-pinned data dir → ~/hack26/data → ~/.hack26/cdl. If
-    nothing is found we download from the workshop S3 mirror (2025 10 m only,
-    AWS CLI required) or NASS HTTPS, then extract.
+    Strict-mode discovery: the file MUST already live under ``_data_root()``
+    (``$HACK26_CDL_DATA_DIR`` or ``~/hack26/data``). No ``~/.hack26`` fallback,
+    no implicit downloads. If the raster is missing we raise
+    ``FileNotFoundError`` so callers don't accidentally trigger a 1.6-9.8 GB
+    pull from a hot path.
 
-    ``refresh=True`` forces a re-download + re-extract (drops the cached zip
-    and the extracted .tif inside ``~/.hack26/cdl/``; pre-mounted EFS copies
-    are read-only and left alone).
+    Pass ``allow_download=True`` (or run the CLI with ``--allow-download``)
+    to opt-in to fetching+extracting from NASS / the workshop S3 mirror;
+    that path also writes into the data root, never ``~/.hack26``.
     """
     _validate(year, resolution)
 
     if refresh:
-        # Only ever clobber files we own — never the EFS mount.
-        for p in (_zip_path(year, resolution), _cache_dir() / _tif_basename(year, resolution)):
+        # Only ever clobber files inside the data root.
+        for p in (_zip_path(year, resolution), _data_root() / _tif_basename(year, resolution)):
             p.unlink(missing_ok=True)
     else:
         existing = _find_existing_tif(year, resolution)
         if existing is not None:
             return existing
+
+    if not allow_download:
+        expected = _data_root() / _tif_basename(year, resolution)
+        raise FileNotFoundError(
+            f"CDL raster missing: {expected}\n"
+            f"Engine is in strict mode — no implicit downloads, no "
+            f"~/.hack26 fallback.\n"
+            f"Either pre-stage the file (workshop EFS should ship "
+            f"2025_10m_cdls.tif), or call with allow_download=True "
+            f"(CLI: --allow-download) to fetch into the data root."
+        )
 
     zip_path = _download_zip(year, resolution, source=source)
     return _extract_tif(zip_path, year, resolution)
@@ -387,11 +413,12 @@ def fetch_counties_cdl(
 
     Opens the national raster exactly once and walks each row. Returns one
     DataFrame keyed by ``geoid``. Result is cached as parquet under
-    ``~/.hack26/cdl/county_features_{year}_{res}m_{nrows}_{hash}.parquet`` so a
-    repeat call with the same county set is an in-memory read. The hash is a
-    short digest over the sorted geoids so two different county sets of the
-    same size (e.g. 5 Iowa counties vs 5 Colorado counties) get distinct
-    cache files instead of silently colliding.
+    ``<data_root>/derived/county_features_{year}_{res}m_{nrows}_{hash}.parquet``
+    (i.e. alongside the EFS rasters — never ``~/.hack26``) so a repeat call
+    with the same county set is an in-memory read. The hash is a short
+    digest over the sorted geoids so two different county sets of the same
+    size (e.g. 5 Iowa counties vs 5 Colorado counties) get distinct cache
+    files instead of silently colliding.
     """
     _validate(year, resolution)
     import rasterio
@@ -402,7 +429,7 @@ def fetch_counties_cdl(
     geoids_sorted = sorted(str(g) for g in counties["geoid"])
     geoid_hash = hashlib.sha1("\n".join(geoids_sorted).encode("utf-8")).hexdigest()[:12]
     cache = (
-        _cache_dir()
+        _derived_dir()
         / f"county_features_{year}_{resolution}m_{len(counties)}_{geoid_hash}.parquet"
     )
     if cache.exists() and not refresh:
@@ -473,11 +500,18 @@ def _main(argv: list[str] | None = None) -> int:
                         help="Subset to one or more state names / 2-digit FIPS. "
                              "Omit for all 5 target states.")
     parser.add_argument("--refresh", action="store_true",
-                        help="Force re-download + re-extract + re-aggregate.")
+                        help="Force re-extract + re-aggregate. Implies --allow-download "
+                             "for the raster step if the raster is missing.")
     parser.add_argument("--source", choices=("auto", "workshop", "nass"), default="auto",
-                        help="Where to fetch the zip from when a download is needed.")
+                        help="Where to fetch the zip from when a download is needed. "
+                             "Only consulted under --allow-download / --download-only.")
+    parser.add_argument("--allow-download", action="store_true",
+                        help="Permit fetching the national raster from NASS / workshop S3 "
+                             "into the data root if it isn't already pre-staged. Off by "
+                             "default — engine refuses implicit multi-GB downloads.")
     parser.add_argument("--download-only", action="store_true",
-                        help="Just fetch + extract the national raster; skip per-county work.")
+                        help="Just fetch + extract the national raster (writes into the "
+                             "data root); skip per-county work. Implies --allow-download.")
     parser.add_argument("--out", type=Path, default=None,
                         help="Optional output path (.parquet or .csv) for the per-county frame.")
     args = parser.parse_args(argv)
@@ -489,9 +523,17 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.download_only:
         tif = load_cdl(year=args.year, resolution=args.resolution,
-                       refresh=args.refresh, source=args.source)
+                       refresh=args.refresh, source=args.source,
+                       allow_download=True)
         print(f"raster ready: {tif}")
         return 0
+
+    # Pre-flight: surface the strict-mode FileNotFoundError before we do any
+    # geopandas work, so the operator gets a clean message instead of a
+    # mid-pipeline traceback.
+    load_cdl(year=args.year, resolution=args.resolution,
+             refresh=args.refresh, source=args.source,
+             allow_download=args.allow_download)
 
     # Lazy import so the module is usable for inspection without geopandas wired up.
     from engine.counties import load_counties

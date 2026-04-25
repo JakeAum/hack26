@@ -20,7 +20,6 @@ import pytest
 
 from engine.cdl import (
     LATEST_YEAR,
-    _data_dirs,
     _find_existing_tif,
     _tif_basename,
 )
@@ -43,11 +42,28 @@ CORN_PCT_HI = 0.85   # 85% — a checked-out Story-county-style monoculture ceil
 
 
 def _pick_available() -> tuple[int, int] | None:
-    """Find the first (year, resolution) pair whose .tif is already on disk."""
+    """Find the first (year, resolution) pair whose .tif is already on disk.
+
+    ``_find_existing_tif`` raises ``FileNotFoundError`` when the data root
+    itself is missing — caught here so the test skips cleanly on machines
+    without the EFS mount instead of erroring out at collection time.
+    """
     for year, res in CANDIDATES:
-        if _find_existing_tif(year, res) is not None:
-            return (year, res)
+        try:
+            if _find_existing_tif(year, res) is not None:
+                return (year, res)
+        except FileNotFoundError:
+            return None
     return None
+
+
+def _data_root_for_skip_msg() -> str:
+    """Best-effort string for the skip message; never raises."""
+    try:
+        from engine.cdl import _data_root
+        return str(_data_root())
+    except FileNotFoundError as e:
+        return str(e).splitlines()[0]
 
 
 pytest.importorskip("rasterio", reason="CDL smoke test needs rasterio")
@@ -56,11 +72,11 @@ pytest.importorskip("rasterio", reason="CDL smoke test needs rasterio")
 def test_iowa_first_five_counties_corn() -> None:
     pick = _pick_available()
     if pick is None:
-        searched = "\n    ".join(str(d) for d in _data_dirs())
         pytest.skip(
-            "no pre-extracted CDL raster found on disk; refusing to trigger a "
-            f"1.6+ GB download in a smoke test.\nsearched:\n    {searched}\n"
-            f"expected basenames: {[_tif_basename(y, r) for y, r in CANDIDATES]}"
+            "no pre-extracted CDL raster found in the data root; engine is "
+            "in strict mode and won't trigger a 1.6+ GB download in a smoke "
+            f"test.\ndata root: {_data_root_for_skip_msg()}\n"
+            f"expected one of: {[_tif_basename(y, r) for y, r in CANDIDATES]}"
         )
     year, resolution = pick
 
@@ -106,8 +122,7 @@ def test_iowa_first_five_counties_corn() -> None:
 def _main() -> int:
     pick = _pick_available()
     if pick is None:
-        searched = "\n    ".join(str(d) for d in _data_dirs())
-        print(f"[smoke] no CDL raster on disk; searched:\n    {searched}",
+        print(f"[smoke] no CDL raster on disk; data root: {_data_root_for_skip_msg()}",
               file=sys.stderr)
         return 0
     year, resolution = pick
