@@ -1,0 +1,39 @@
+[project]
+name = "hack26"
+version = "0.0.1"
+description = "Geospatial AI corn-yield forecasting (CSU hackathon 2026)."
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2",
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyogrio>=0.9",
+    "pyarrow>=16.0",
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+hack26-counties = "engine.counties:_main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# `engine` lives under software/, not at the repo root. Treat software/ as the
+# package source root so `import engine` works from anywhere once installed.
+[tool.setuptools]
+package-dir = {"" = "software"}
+
+[tool.setuptools.packages.find]
+where = ["software"]
+include = ["engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["software/tests"]
+pythonpath = ["software"]
+addopts = "-ra -q"

@@ -68,5 +68,4 @@ B12   | SWIR-2       | 2190   | 20m  | Dry biomass, geology
 * SWIR low => leaves are water-rich and turgid, since water absorbs SWIR
 
   
-
 ---
