@@ -45,7 +45,10 @@ _NAME_TO_FIPS = {v.lower(): k for k, v in TARGET_STATES.items()}
 
 
 def _cache_dir() -> Path:
-    root = Path(os.environ.get("HACK26_CACHE_DIR", Path.home() / ".hack26"))
+    # Default to ~/hack26/data so the SageMaker workshop box keeps all engine
+    # caches on the mounted EFS volume alongside the pre-staged CDL raster.
+    # Override with HACK26_CACHE_DIR for laptops / CI / anywhere without EFS.
+    root = Path(os.environ.get("HACK26_CACHE_DIR", Path.home() / "hack26" / "data"))
     d = root / "tiger"
     d.mkdir(parents=True, exist_ok=True)
     return d
