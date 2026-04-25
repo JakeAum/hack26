@@ -1377,6 +1377,29 @@ The `historical_mean_yield_bu_acre` static covariate is computed
 strictly from years before each row's `year` so even within-train
 aggregations are leak-free.
 
+**Encoder-prior injection (broadcast-target leak fix).** The bundle's
+target series for a labeled `(county, year)` is
+`[actual_NASS_yield] × season_days` — a constant. Without intervention,
+Darts' TFT reads the target component as part of its encoder input, lets
+the model trivially read the answer off the encoder, and collapses the
+supervised loss to ~zero (observed: `test_2024 RMSE = 1.46 bu/ac`,
+`coverage = 0.97`). To prevent this:
+
+- `engine.model._inject_encoder_prior(target, input_chunk, jitter_std)`
+  overwrites the first `input_chunk` days of every target series with the
+  per-county `historical_mean_yield_bu_acre` static covariate (already
+  computed from `< year` so it's leak-free). The decoder window keeps the
+  actual yield as the supervised label.
+- Called from `train_tft` (with default `jitter_std=5.0` bu/ac of
+  Gaussian noise as a regularizer; tunable via `--encoder-prior-jitter`)
+  and from `predict_tft` (with `jitter_std=0`).
+- For the deliverable inference bundle from `build_inference_dataset`
+  (whose targets are already the historical mean), the predict-time call
+  is a no-op — the function always produces an in-distribution encoder.
+- The `_BundleScaler` standardization is fit on the **prior-injected**
+  training bundle, so the train-time and inference-time scaler inputs
+  coincide.
+
 **Pass 1 — Measurement.** Honest 2024-out-of-sample number for the deck.
 
 ```bash

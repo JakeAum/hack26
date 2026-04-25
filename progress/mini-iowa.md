@@ -189,3 +189,131 @@ If any of those miss, dig into the static-covariate path and the
 hyperparameters (`hidden_size`, `dropout`, `lr`); if they hit, repeat the same recipe with
 `--forecast-date all` and the four-state-plus-Iowa bundle for the
 deliverable.
+
+## RUN-2 results — leaked, not skill (Apr 25 19:03)
+
+The Iowa 2008-2024 run completed cleanly:
+
+- EarlyStopping at epoch 64, best `val_loss = 0.011` (z-scored quantile loss)
+- 65 epochs in 8.7 min on T4 → ~8 s/epoch
+- `test_2024`: **RMSE = 1.46 bu/ac, MAPE = 0.24%, P10-P90 coverage = 0.97**
+
+Those numbers are not "we beat USDA" — they're a **target leak** signature:
+
+- USDA WASDE state-level corn forecasts run **6-10 bu/ac RMSE**.
+- A *calibrated* 80% interval should sit at ~0.80 coverage, not 0.97.
+- `val_loss < train_loss` for the entire run, with both collapsing to ~0
+  in 11 epochs.
+
+### Where the leak comes from
+
+`software/engine/dataset.py::_build_series_for_county_year` broadcasts the
+**actual final yield** as a constant across every day of the season:
+
+```python
+target_values = np.full((len(season_dates), 1), float(label), dtype=np.float32)
+```
+
+Darts' TFT reads the target component as one of its encoder inputs, so the
+encoder for the 2024 test bundle saw `[actual_2024_yield] × 122` for every
+county. The decoder's job collapsed to "output the same constant" — an
+identity map, ~zero pinball loss, and zero generalization.
+
+**Worse — it would also break Pass 2.** The deliverable inference path
+(`build_inference_dataset`) broadcasts the per-county *historical mean* as
+the target (since the 2025 yield isn't known). So at inference the encoder
+distribution is a different constant than what the model was trained on,
+and the model — which only ever learned `output ≈ encoder_constant` — would
+output something close to the historical mean and almost no skill from
+weather / NDVI / GDD.
+
+### Fix #1 + Fix #2 — implemented Apr 25 (in `engine.model`)
+
+Both fixes are pure functions of the target series; no bundle rebuild.
+
+- **Fix #1: `_inject_encoder_prior(target, input_chunk, jitter_std=0)`**
+  overwrites the first `input_chunk` days of every target series with the
+  per-county `historical_mean_yield_bu_acre` static covariate (which is
+  computed strictly from `< target_year` in
+  `_historical_mean_yields`, so it's leak-free). The decoder window keeps
+  the actual yield as the supervised label. Called from `train_tft` AND
+  `predict_tft`, so train-time and inference-time encoder distributions
+  match exactly. For the deliverable inference bundle (whose targets are
+  already historical means), this is a no-op.
+
+- **Fix #2: `jitter_std=5.0` (default) at training time only.** Adds
+  Gaussian noise (~17% of typical Iowa yield std) to the encoder prior so
+  the model can't memorize the constant — it has to look at past
+  covariates and statics to refine. Inference uses `jitter_std=0`
+  (deterministic). Configurable via `--encoder-prior-jitter`.
+
+- The `_BundleScaler` is now fit on the **prior-injected** training
+  bundle, so the standardization parameters reflect the encoder
+  distribution the model actually sees at predict time.
+
+### Expected impact on RUN-3
+
+Honest skill should land somewhere in:
+
+- `test_2024 RMSE`: **6-15 bu/ac** (USDA WASDE territory)
+- `MAPE`: **3-8%**
+- `P10-P90 coverage`: **0.65-0.85** (calibrated, not over-tight)
+- `val_loss` **above** `train_loss` once past epoch ~10 (normal direction)
+
+If we instead see RMSE < 3 or coverage > 0.95 again, there's a *second*
+leak we haven't found yet (most likely candidate: a static covariate
+computed with `<= year` somewhere). If we see RMSE > 30 or coverage < 0.4,
+the model isn't learning anything from weather/NDVI and we need to revisit
+hyperparameters or the past-covariate set.
+
+## RUN-3: re-measurement after Fix #1 + #2
+
+Re-run the **exact same Pass-1 command** — bundle on disk is unchanged, so
+no dataset rebuild. The only difference is the new injection happening
+inside `train_tft` / `predict_tft`.
+
+```bash
+cd ~/hack26 && git pull
+hack26-train \
+  --states Iowa \
+  --forecast-date aug1 \
+  --train-years 2008-2022 \
+  --val-year 2023 \
+  --test-year 2024 \
+  --epochs 120 \
+  --patience 20 \
+  --batch-size 128 \
+  --num-samples 500 \
+  --encoder-prior-jitter 5.0 \
+  --accelerator gpu --devices 1 --precision 32-true \
+  --out-dir iowa_2008_2024_aug1_run3 \
+  -v --log-file ~/hack26/data/derived/logs/train_iowa_2008_2024_aug1_run3.log
+```
+
+Notes:
+
+- `--out-dir iowa_2008_2024_aug1_run3` keeps RUN-2's leaky checkpoint
+  intact for comparison; it lives next to the new one under
+  `derived/models/`.
+- The cached bundle at `derived/bundles/last_training_bundle.pkl` is
+  reused (rebuild not required).
+- The first epoch's log line should now read
+  `encoder-prior injection: input_chunk=122  jitter_std=5.00 bu/ac
+   train_series=1439  val_series=87`. If that line is missing, the new
+  code didn't make it onto the box — re-pull and verify
+  `git log -1 --oneline`.
+- Watch for `train_loss > val_loss` after epoch ~10 (the right direction
+  this time) and `val_loss` plateauing at a non-zero value (~0.2-0.4 in
+  z-scored quantile loss is a healthy realistic floor; previous run hit
+  0.011 because of the leak).
+
+### What to paste back
+
+- `~/hack26/data/derived/logs/train_iowa_2008_2024_aug1_run3.log` (tail)
+- `~/hack26/data/derived/logs/train_aug1_*.csv` (per-epoch CSV)
+- `~/hack26/data/derived/reports/test_2024_metrics.csv`
+- `~/hack26/data/derived/reports/test_2024_predictions_aug1.parquet`
+
+If RMSE lands in 6-15 bu/ac with coverage 0.65-0.85, kick off Pass 2
+(deliverable retrain on 2008-2024 with `--forecast-date all`,
+`--no-test`, `--out-dir final`).

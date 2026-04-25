@@ -585,6 +585,121 @@ class _BundleScaler:
 
 
 # ---------------------------------------------------------------------------
+# Encoder-prior injection (fixes the broadcast-target leak; see notes below)
+# ---------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# The bundle's target series for a labeled (county, year) is
+# ``[actual_NASS_yield] x season_days`` — a constant. With Darts' TFT the
+# encoder reads the target component as one of its inputs, so the model can
+# trivially read the answer off the encoder window and the supervised loss
+# collapses to ~zero (``test_2024 RMSE = 1.46 bu/ac, MAPE = 0.24%`` — see
+# progress/mini-iowa.md). At deliverable time the encoder target is the
+# per-county *historical mean* (built by ``build_inference_dataset``), so the
+# trained model would also be pushed wildly out-of-distribution.
+#
+# Fix #1: inject the historical mean into the encoder window at train AND
+#         predict time, so the encoder distribution is identical in both
+#         regimes. The decoder window keeps the actual yield (the supervised
+#         label) so the model still learns to forecast.
+# Fix #2: at training time, perturb the prior with small Gaussian noise so
+#         the model treats it as a noisy hint rather than a perfect prior
+#         (a regularizer; pass ``jitter_std=0`` at inference).
+#
+# Both fixes are pure functions of the target series — no bundle rebuild.
+
+_HISTORICAL_MEAN_STATIC_COL = "historical_mean_yield_bu_acre"
+
+
+def _inject_encoder_prior(
+    target_series: Sequence,
+    input_chunk: int,
+    *,
+    jitter_std: float = 0.0,
+    rng: np.random.Generator | None = None,
+) -> list:
+    """Replace the first ``input_chunk`` steps of each target series with
+    the per-series ``historical_mean_yield_bu_acre`` static covariate.
+
+    Args:
+        target_series: list of Darts ``TimeSeries`` (one per (geoid, year)).
+        input_chunk: encoder length for the variant being trained / predicted
+            (``aug1`` -> 122d, ``sep1`` -> 153d, ``oct1`` -> 183d,
+             ``final`` -> 243d). Determines how many leading days are
+            overwritten.
+        jitter_std: standard deviation (bu/ac) of Gaussian noise added to the
+            prior block. ``> 0`` only at training time; the helper is
+            deterministic at ``0.0``.
+        rng: optional ``np.random.Generator`` for reproducibility (a fresh
+            ``default_rng(42)`` is used if ``None``).
+
+    Returns:
+        A new list of ``TimeSeries`` with the encoder window overwritten,
+        decoder window untouched, static_covariates preserved verbatim.
+
+    Notes:
+        - Series whose static frame lacks ``historical_mean_yield_bu_acre``
+          (or whose static frame is ``None``) are passed through unchanged
+          and a single warning is logged at the end.
+        - Series shorter than ``input_chunk`` get their entire value array
+          overwritten with the prior, which is the correct behavior for the
+          ``predict_tft`` path (where we already truncated to the encoder).
+    """
+    from darts import TimeSeries
+
+    if not target_series:
+        return []
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    out: list = []
+    n_skipped = 0
+    for ts in target_series:
+        sc = ts.static_covariates
+        if sc is None or _HISTORICAL_MEAN_STATIC_COL not in sc.columns:
+            n_skipped += 1
+            out.append(ts)
+            continue
+
+        prior = float(sc[_HISTORICAL_MEAN_STATIC_COL].iloc[0])
+        n = min(int(input_chunk), len(ts))
+        if n <= 0:
+            out.append(ts)
+            continue
+
+        values = ts.values(copy=True).astype(np.float32)
+        prior_block = np.full((n, values.shape[1]), prior, dtype=np.float32)
+        if jitter_std > 0:
+            prior_block = prior_block + rng.normal(
+                loc=0.0, scale=float(jitter_std), size=prior_block.shape
+            ).astype(np.float32)
+        values[:n, :] = prior_block
+
+        try:
+            new_ts = ts.with_values(values)
+        except AttributeError:
+            new_ts = TimeSeries.from_times_and_values(
+                times=ts.time_index,
+                values=values,
+                columns=list(ts.columns),
+                fill_missing_dates=False,
+                freq=ts.freq_str,
+                static_covariates=sc,
+            )
+        out.append(new_ts)
+
+    if n_skipped:
+        logger.warning(
+            "_inject_encoder_prior: %d/%d series had no "
+            "historical_mean_yield_bu_acre static covariate and were passed "
+            "through unchanged (encoder leak still present for those series).",
+            n_skipped, len(target_series),
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -616,6 +731,7 @@ def train_tft(
     devices: int | str = "auto",
     precision: str | int = "32-true",
     random_state: int = 42,
+    encoder_prior_jitter_std: float = 5.0,
 ):
     """Train one TFTModel variant on the year-split slice of ``bundle``.
 
@@ -627,6 +743,12 @@ def train_tft(
         epoch_csv_path: where to write the per-epoch CSV. ``None`` -> default
             under ``~/hack26/data/derived/logs/``.
         accelerator/devices/precision: forwarded to PL trainer.
+        encoder_prior_jitter_std: bu/ac standard deviation of Gaussian noise
+            added to the encoder-window historical-mean prior at training
+            time (Fix #2 in :func:`_inject_encoder_prior`). ``0.0`` disables
+            jitter and uses the deterministic prior. Default ``5.0`` is
+            ~17 % of the typical Iowa cross-county yield std and acts as a
+            mild regularizer.
 
     Returns:
         Fitted ``TFTModel`` with sidecar attributes
@@ -686,12 +808,57 @@ def train_tft(
         precision=precision,
     )
 
+    # Encoder-prior injection (Fix #1 + Fix #2 from progress/mini-iowa.md).
+    # Without this, the encoder reads the actual yield off the broadcast
+    # target and the supervised loss collapses to ~zero (test_2024 leak).
+    # We overwrite the first ``input_chunk`` days of every train + val target
+    # series with the per-county historical mean (matching what
+    # build_inference_dataset does for the deliverable 2025 bundle), plus
+    # mild Gaussian jitter on the train side as a regularizer.
+    input_chunk_for_prior, _ = _resolve_chunk_lengths(forecast_date)
+    train_rng = np.random.default_rng(int(random_state))
+    train_target_series = _inject_encoder_prior(
+        train_bundle.target_series,
+        input_chunk=input_chunk_for_prior,
+        jitter_std=float(encoder_prior_jitter_std),
+        rng=train_rng,
+    )
+    val_target_series = (
+        _inject_encoder_prior(
+            val_bundle.target_series,
+            input_chunk=input_chunk_for_prior,
+            jitter_std=0.0,
+        )
+        if val_bundle is not None and val_bundle.n_series > 0
+        else None
+    )
+    logger.info(
+        "encoder-prior injection: input_chunk=%d  jitter_std=%.2f bu/ac  "
+        "train_series=%d  val_series=%s",
+        input_chunk_for_prior, float(encoder_prior_jitter_std),
+        len(train_target_series),
+        len(val_target_series) if val_target_series is not None else "0",
+    )
+
+    # Build a *prior-injected* TrainingBundle view so the scaler fits on the
+    # same encoder distribution the model will see at inference. We reuse the
+    # original bundle's other columns and replace just the target_series list.
+    train_bundle_for_scaler = TrainingBundle(
+        target_series=train_target_series,
+        past_covariates=train_bundle.past_covariates,
+        future_covariates=train_bundle.future_covariates,
+        static_covariates=train_bundle.static_covariates,
+        series_index=train_bundle.series_index,
+        past_covariate_cols=list(train_bundle.past_covariate_cols),
+        static_covariate_cols=list(train_bundle.static_covariate_cols),
+    )
+
     # Standardize target + past + statics on the *training* slice so the
     # model sees roughly N(0, 1) inputs instead of raw Kelvin / GDD-cumulative
     # magnitudes. Predictions are inverse-transformed back to bu/acre in
     # ``predict_tft`` via the same fitted scaler.
-    bundle_scaler = _BundleScaler.fit(train_bundle)
-    train_targets = bundle_scaler.transform_target_series(train_bundle.target_series)
+    bundle_scaler = _BundleScaler.fit(train_bundle_for_scaler)
+    train_targets = bundle_scaler.transform_target_series(train_target_series)
     train_past = bundle_scaler.transform_past(train_bundle.past_covariates)
 
     fit_kwargs: dict = {
@@ -700,9 +867,9 @@ def train_tft(
         "future_covariates": train_bundle.future_covariates,
         "verbose": True,
     }
-    if val_bundle is not None and val_bundle.n_series > 0:
+    if val_target_series is not None:
         fit_kwargs["val_series"] = bundle_scaler.transform_target_series(
-            val_bundle.target_series
+            val_target_series
         )
         fit_kwargs["val_past_covariates"] = bundle_scaler.transform_past(
             val_bundle.past_covariates
@@ -780,6 +947,18 @@ def predict_tft(
             truncated_targets.append(ts)
         else:
             truncated_targets.append(ts[:input_chunk])
+
+    # Encoder-prior injection — must match what train_tft did. For a
+    # *measurement* (test_year) bundle the truncated target still contains
+    # ``[actual_yield] x input_chunk`` (the leak); for the deliverable
+    # inference bundle from build_inference_dataset it already contains
+    # ``[historical_mean] x input_chunk``, in which case this call is a
+    # no-op. ``jitter_std=0`` because we want deterministic predictions.
+    truncated_targets = _inject_encoder_prior(
+        truncated_targets,
+        input_chunk=input_chunk,
+        jitter_std=0.0,
+    )
 
     # Apply the same StandardScaler the model was trained against (target +
     # past + statics). Future covariates remain raw — the calendar features
@@ -951,6 +1130,7 @@ def _train_one_pass(
             devices=args.devices,
             precision=args.precision,
             random_state=args.seed,
+            encoder_prior_jitter_std=getattr(args, "encoder_prior_jitter", 5.0),
         )
         ckpt = out_dir / f"tft_{fd}.pt"
         save_tft(model, ckpt)
@@ -1022,6 +1202,15 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--encoder-prior-jitter", type=float, default=5.0,
+        help=(
+            "bu/ac standard deviation of Gaussian noise added to the encoder-"
+            "window historical-mean prior at TRAINING time (Fix #2). 0.0 "
+            "disables jitter and uses the deterministic prior. Default 5.0 "
+            "is ~17%% of the typical Iowa cross-county yield std."
+        ),
+    )
     parser.add_argument("--patience", type=int, default=8,
                         help="Early-stopping patience (epochs).")
     parser.add_argument("--num-samples", type=int, default=200,
