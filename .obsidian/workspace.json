@@ -18,13 +18,17 @@
             }
           },
           {
-            "id": "6b89db20b79f015d",
+            "id": "8de7ec4a22f44723",
             "type": "leaf",
             "state": {
-              "type": "graph",
-              "state": {},
-              "icon": "lucide-git-fork",
-              "title": "Graph view"
+              "type": "markdown",
+              "state": {
+                "file": "documentation/Sentinal.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Sentinal"
             }
           }
         ],
@@ -190,8 +194,11 @@
       "omnisearch:Omnisearch": false
     }
   },
-  "active": "6b89db20b79f015d",
+  "active": "8de7ec4a22f44723",
   "lastOpenFiles": [
+    "software",
+    "documentation/onboarding.md",
+    "documentation/CSU Hackathon - Geospatial AI Crop Yield Forecasting_FINAL.pdf",
     "Sentinal.md",
     "documentation/Sentinal.md",
     "documentation/README.md",
