@@ -656,7 +656,7 @@ def _parse_year_range(s: str) -> list[int]:
 
 
 def _resolve_models_dir(out_dir: str) -> Path:
-    from .dataset import _logs_dir as _ld  # type: ignore
+    from ._logging import _logs_dir as _ld
     # Use the same data root convention as logs.
     root = _ld().parent  # derived/
     d = root / "models" / out_dir
