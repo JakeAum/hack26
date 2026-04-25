@@ -24,6 +24,15 @@ sentinel = [
     "stackstac>=0.5",
     "planetary-computer>=1.0",
 ]
+# TFT model + training stack. Gated because torch+lightning is ~2 GB installed
+# and the engine is fully usable for data assembly without it.
+forecast = [
+    "darts>=0.30",
+    "torch>=2.2",
+    "pytorch-lightning>=2.2",
+    "scikit-learn>=1.4",
+    "rich>=13",
+]
 dev = [
     "pytest>=8.0",
 ]
@@ -33,6 +42,10 @@ hack26-counties = "engine.counties:_main"
 hack26-cdl = "engine.cdl:_main"
 hack26-weather = "engine.weather.core:_main"
 hack26-nass = "engine.nass.core:_main"
+hack26-dataset = "engine.dataset:_main"
+hack26-train = "engine.model:_main"
+hack26-forecast = "engine.forecast:_main"
+hack26-analogs = "engine.analogs:_main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
