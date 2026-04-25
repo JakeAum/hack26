@@ -19,9 +19,8 @@ flowchart TD
         direction LR
         Counties["counties (built)"]
         CDL["CDL corn mask (built)"]
+        WX["Weather<br/>POWER + SMAP + Sentinel-2 (built)"]
         HLS["Imagery — HLS"]:::planned
-        WX["Weather<br/>POWER / ERA5 / GEFS"]:::planned
-        SM["Soil moisture — SMAP"]:::planned
         NASS["NASS yields<br/>(ground truth)"]:::planned
     end
 
@@ -230,31 +229,155 @@ sequenceDiagram
 - No sub-county aggregation — `fetch_county_cdl` accepts an arbitrary polygon, so field-level callers plug in via the same function; the per-state CLI just wraps the county geometry case.
 - No confidence-layer ingest — NASS publishes a separate `{year}_30m_Confidence_Layer.zip`; out of scope for the MVP.
 
-## 6. Repository layout
+## 6. Component: Weather `engine.weather`
+
+**Purpose.** Per-county daily climate, soil, and vegetation observations,
+fused into a single tidy frame keyed on `geoid`. Combines three sources, all
+pulled on demand and cached to local parquet so any later call with the same
+`(geoid, date_range)` returns a byte-identical frame:
+
+- **NASA POWER** (daily reanalysis, 1981+) — precipitation, humidity,
+  evapotranspiration, soil wetness (top, root-zone, full-profile), and a
+  full temperature stack (`T2M`, `T2M_MAX`, `T2M_MIN`, `TS`, `T10M`,
+  `FROST_DAYS`).
+- **NASA SMAP-derived surface soil moisture** (m³/m³, 2015+) via the same
+  POWER endpoint (`SMLAND`).
+- **Sentinel-2 L2A** (NDVI + NDWI per scene, 2015+) via Microsoft Planetary
+  Computer's STAC + `stackstac` (optional dep group `[sentinel]`).
+
+**Determinism / lookup-consistency contract.** The SPEC §2 contract is
+`fetch(geoid, geometry, date_range) -> pd.DataFrame`. NASA POWER is a *point*
+API, so each county is collapsed to a single representative `(lat, lon)`:
+the TIGER `INTPTLAT`/`INTPTLON` interior point (preferred, guaranteed inside
+the polygon) or the polygon centroid as a fallback. Two calls for the same
+county and date range therefore always hit the same POWER grid cell and the
+same parquet cache file, making the result reproducible across processes and
+machines.
+
+**Output schema** (returned by `fetch_county_weather` /
+`fetch_counties_weather`):
+
+| Column                     | Source     | Notes                                                 |
+| -------------------------- | ---------- | ----------------------------------------------------- |
+| **index** `(date, geoid)`  | —          | All sources joined on this multi-index.               |
+| `PRECTOTCORR`              | POWER      | Precipitation (mm/day).                               |
+| `RH2M`, `T2MDEW`           | POWER      | Humidity (%) and dewpoint (°C) at 2 m.                |
+| `EVPTRNS`                  | POWER      | Evapotranspiration (mm/day).                          |
+| `GWETTOP`, `GWETROOT`, `GWETPROF` | POWER | Soil wetness (0–1) at 0–5 cm, root zone, full profile. |
+| `T2M`, `T2M_MAX`, `T2M_MIN`, `TS`, `T10M` | POWER | Air / surface temperature stack (°C).         |
+| `FROST_DAYS`               | POWER      | Monthly value, repeated daily (see annual aggregator). |
+| `SMAP_surface_sm_m3m3`     | SMAP       | Surface soil moisture (m³/m³, 2015+, NaN earlier).    |
+| `NDVI`, `NDWI`             | Sentinel-2 | Per-scene means, forward-filled per county.           |
+| `GDD`                      | derived    | Corn GDD (°C-day, base 10 °C, max-cap 30 °C).         |
+| `GDD_cumulative`           | derived    | Cumulative GDD, **resets per (geoid, year)**.         |
+| `<col>_7d_avg`, `<col>_30d_avg` | derived | Per-county rolling means for every base column.    |
+
+**Public API.**
+```python
+from engine.weather import (
+    fetch_county_weather, fetch_counties_weather,
+    fetch_county_power,   fetch_counties_power,
+    fetch_county_smap,    fetch_counties_smap,
+    fetch_county_sentinel, fetch_counties_sentinel,
+    compute_gdd, add_rolling_features, build_annual_summary,
+    merge_weather,
+)
+from engine.counties import load_counties
+
+ia = load_counties(states=["Iowa"])
+df = fetch_counties_weather(ia, start_year=2020, end_year=2024,
+                            include_sentinel=False)        # daily (date,geoid)
+annual = build_annual_summary(df)                          # per (geoid, year)
+```
+
+**On-disk layout** (under the same data root as the CDL engine —
+`$HACK26_CDL_DATA_DIR` if set, else `~/hack26/data`; auto-created since these
+are small per-county API hits, not multi-GB rasters):
+```
+~/hack26/data/derived/weather/
+├── power_19169_2020_2024.parquet                                  # one per (geoid, range)
+├── smap_19169_2020_2024.parquet                                   # 2015+; empty pre-SMAP
+├── sentinel_19169_20200101_20241231.parquet                       # one per (geoid, range)
+└── weather_daily_99_<sha1[:12]>_2020_2024.parquet                 # full merged frame
+```
+
+**Call flow.**
+
+```mermaid
+sequenceDiagram
+    participant Caller as Caller (CLI / Engine)
+    participant Core as fetch_county_weather()
+    participant Cache as ~/hack26/data/derived/weather/
+    participant POWER as NASA POWER
+    participant SMAP as NASA POWER (SMLAND)
+    participant STAC as Planetary Computer<br/>(Sentinel-2 L2A)
+
+    Caller->>Core: (geoid, geometry, start_year, end_year)
+    Core->>Cache: power_<geoid>_<start>_<end>.parquet present?
+    alt cache hit
+        Cache-->>Core: parquet
+    else cache miss
+        Core->>POWER: GET point query @ (INTPTLAT, INTPTLON)
+        POWER-->>Core: daily JSON
+        Core->>Cache: write parquet
+    end
+    opt include_smap
+        Core->>SMAP: GET SMLAND @ same point (≥ 2015)
+        SMAP-->>Cache: parquet
+    end
+    opt include_sentinel
+        Core->>STAC: search L2A in geometry.bounds, cloud<20%
+        STAC-->>Core: items[]
+        Core->>Cache: per-scene NDVI/NDWI parquet
+    end
+    Core->>Core: merge on (date,geoid), compute_gdd, add_rolling_features
+    Core-->>Caller: DataFrame
+```
+
+**Non-goals.**
+- No raster reprojection of Sentinel-2 — bands are read at 30 m by default
+  and reduced to a single per-scene mean; full 10 m county aggregation is a
+  ~25 M-pixel/scene problem and out of scope for the MVP.
+- No alternative weather backends (ERA5, GEFS) yet — same `(geoid, geometry,
+  date_range)` contract, so they slot in as sibling modules under
+  `engine/weather/` without changing the merge layer.
+- No backfill of older Sentinel/SMAP — pre-2015 dates just yield NaN for
+  those columns; POWER alone covers 1981+.
+
+## 7. Repository layout
 
 ```
 hack26/
-├── pyproject.toml           # source of truth for deps, package config, pytest
+├── pyproject.toml              # source of truth for deps, package config, pytest
 ├── software/
-│   ├── requirements.txt     # locked runtime deps (uv pip compile output)
-│   ├── requirements-dev.txt # locked runtime + dev deps
+│   ├── requirements.txt        # locked runtime deps (uv pip compile output)
+│   ├── requirements-dev.txt    # locked runtime + dev deps
 │   ├── engine/
-│   │   ├── __init__.py      # lazy re-exports for all built sources
-│   │   ├── counties.py      # County Catalog implementation + CLI
-│   │   └── cdl.py           # CDL Corn Mask implementation + CLI
+│   │   ├── __init__.py         # lazy re-exports for all built sources
+│   │   ├── counties.py         # County Catalog implementation + CLI
+│   │   ├── cdl.py              # CDL Corn Mask implementation + CLI
+│   │   └── weather/
+│   │       ├── __init__.py     # lazy re-exports
+│   │       ├── __main__.py     # python -m engine.weather
+│   │       ├── _cache.py       # parquet cache layout
+│   │       ├── power.py        # NASA POWER + SMAP fetchers
+│   │       ├── sentinel.py     # Sentinel-2 NDVI/NDWI via Planetary Computer
+│   │       ├── features.py     # GDD, rolling, annual summary
+│   │       └── core.py         # merge + fetch_county_weather + CLI
 │   └── tests/
 │       ├── test_counties_smoke.py
-│       └── test_cdl_smoke.py
-└── .venv/                   # local environment (gitignored)
+│       ├── test_cdl_smoke.py
+│       └── test_weather_smoke.py
+└── .venv/                      # local environment (gitignored)
 ```
 
 Local caches (gitignored, live outside the repo):
 - `~/.hack26/tiger/` — TIGER zip + 5-state GeoParquet (county catalog only).
 - `~/hack26/data/` — single source of truth for CDL. Pre-extracted national rasters live here on the AWS workshop machine; `derived/` holds our per-county feature parquets. The CDL engine never writes to `~/.hack26/`.
 
-## 7. Operations
+## 8. Operations
 
-### 7.1 First-time environment setup
+### 8.1 First-time environment setup
 
 Requires Python ≥ 3.11. `uv` is recommended for speed but optional.
 
@@ -266,6 +389,9 @@ python -m uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 # Option B — stock pip + venv
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]"
+
+# Optional: enable Sentinel-2 in engine.weather
+.venv\Scripts\python.exe -m pip install -e ".[sentinel]"
 ```
 
 Cloud worker (no editable install needed if you only want to run, not modify):
@@ -274,7 +400,7 @@ pip install -r software/requirements.txt
 pip install -e .   # registers the `engine` package
 ```
 
-### 7.2 Running the County Catalog
+### 8.2 Running the County Catalog
 
 Module form:
 ```powershell
@@ -289,7 +415,7 @@ Console-script form (after editable install):
 .venv\Scripts\hack26-counties.exe --states Iowa
 ```
 
-### 7.3 Running the CDL Corn Mask
+### 8.3 Running the CDL Corn Mask
 
 Intended to run on the AWS sagemaker workshop instance — the 14.9 GB 2025 10 m raster is already on the EFS mount at `~/hack26/data/`, so the first call only does per-county masking, not a download.
 
@@ -316,23 +442,49 @@ hack26-cdl --year 2025 --resolution 10 --states Iowa
 
 Expected runtime on the AWS box (2025 10 m, all 5 states / 443 counties): ~minutes for the first cold pass; sub-second for cached re-reads (parquet at `~/hack26/data/derived/county_features_2025_10m_443_<hash>.parquet`).
 
-### 7.4 Tests
+### 8.4 Running the Weather source
+
+Module form:
+```powershell
+.venv\Scripts\python.exe -m engine.weather --states Iowa --start 2020 --end 2024
+.venv\Scripts\python.exe -m engine.weather --geoid 19169 --start 2018 --end 2024 --no-sentinel
+.venv\Scripts\python.exe -m engine.weather --states Iowa Colorado --start 2015 --end 2024 ^
+    --no-sentinel --out iowa_co_weather.parquet --annual-out iowa_co_annual.csv
+```
+
+Console-script form (after editable install):
+```bash
+hack26-weather --geoid 19169 --start 2018 --end 2024 --no-sentinel
+```
+
+Notes:
+- Hits NASA POWER live on first call; subsequent identical calls are
+  parquet-cache reads under `~/hack26/data/derived/weather/` and return
+  byte-identical frames (the lookup-consistency contract).
+- `--no-sentinel` is recommended unless `engine.weather`'s `[sentinel]`
+  extras are installed and the box has internet to Planetary Computer.
+- `--sleep 0` to disable the 1 s pause between live POWER calls when
+  pulling many counties (cached counties skip the sleep automatically).
+
+### 8.5 Tests
 
 ```powershell
 .venv\Scripts\python.exe -m pytest software\tests -v
 ```
 
-Two smoke tests:
+Three smoke tests:
 - `software/tests/test_counties_smoke.py` — loads Colorado, eyeballs the first 5 counties, asserts schema + filter + geometry validity + centroid-in-CO-bbox. First run ~10 s (TIGER download); cached <1 s.
 - `software/tests/test_cdl_smoke.py` — runs `fetch_counties_cdl` against the first 5 Iowa counties and asserts schema + per-county corn fraction is in a sane Iowa range (5–85 %). **Auto-skips** when rasterio isn't installed or no national CDL `.tif` is reachable on disk, so it never triggers a multi-GB download from a CI pipe.
+- `software/tests/test_weather_smoke.py` — pulls one year of NASA POWER for Story County, IA and asserts the SPEC §2 contract (`(date, geoid)` index, GDD/GDD_cumulative present, sane Iowa GDD range) plus a back-to-back consistency check that two identical calls return byte-identical frames. Sentinel-2 skipped to keep CI offline-friendly.
 
 Standalone form (each test file is also runnable with `python -m`):
 ```powershell
 .venv\Scripts\python.exe software\tests\test_counties_smoke.py
 .venv\Scripts\python.exe software\tests\test_cdl_smoke.py
+.venv\Scripts\python.exe software\tests\test_weather_smoke.py
 ```
 
-### 7.5 Refreshing the dependency lock
+### 8.6 Refreshing the dependency lock
 
 When `pyproject.toml`'s `[project.dependencies]` or `[project.optional-dependencies]` change (e.g. when `rasterio` was added for the CDL source):
 
@@ -341,7 +493,7 @@ python -m uv pip compile pyproject.toml -o software\requirements.txt
 python -m uv pip compile pyproject.toml --extra dev -o software\requirements-dev.txt
 ```
 
-### 7.6 Refreshing source caches
+### 8.7 Refreshing source caches
 
 TIGER (county catalog):
 ```powershell
@@ -354,7 +506,13 @@ python -m engine.cdl --year 2025 --resolution 30 --refresh                   # r
 python -m engine.cdl --year 2025 --resolution 30 --refresh --allow-download  # re-pull + re-aggregate
 ```
 
-Or, to start fully clean (TIGER + Iowa GeoParquet only — does NOT touch the CDL data root):
+Weather — `--refresh` re-downloads from NASA POWER / SMAP / Sentinel and rebuilds the merged parquet:
+```bash
+python -m engine.weather --states Iowa --start 2020 --end 2024 --refresh
+rm -rf ~/hack26/data/derived/weather/                                          # wipe everything
+```
+
+Or, to start fully clean (TIGER + Iowa GeoParquet only — does NOT touch the CDL or weather data roots):
 ```powershell
 Remove-Item -Recurse -Force $HOME\.hack26
 ```
@@ -364,9 +522,9 @@ To wipe CDL outputs (keep the rasters, drop the derived parquets):
 rm -rf ~/hack26/data/derived/
 ```
 
-### 7.7 Environment variables
+### 8.8 Environment variables
 
 | Var                  | Default              | Effect                                                        |
 | -------------------- | -------------------- | ------------------------------------------------------------- |
-| `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for the County Catalog (TIGER) cache only. Not used by the CDL engine. |
-| `HACK26_CDL_DATA_DIR`| `~/hack26/data`      | **CDL data root.** Single source of truth for rasters AND derived parquet outputs. Must already exist — the CDL engine raises `FileNotFoundError` instead of falling back anywhere else. |
+| `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for the County Catalog (TIGER) cache. Also the **fallback** root for `engine.weather` parquet caches when `HACK26_CDL_DATA_DIR` isn't set. Not used by the CDL engine. |
+| `HACK26_CDL_DATA_DIR`| `~/hack26/data`      | **CDL data root.** Single source of truth for rasters AND derived parquet outputs (CDL + weather). Must already exist for the CDL engine, which raises `FileNotFoundError` instead of falling back anywhere else; weather auto-creates it. |

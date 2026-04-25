@@ -16,6 +16,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Sentinel-2 stack — optional because pystac_client + stackstac drag in xarray,
+# rioxarray, dask, etc. Weather still works without these; the Sentinel fetcher
+# returns empty NDVI/NDWI frames and the merge degrades gracefully.
+sentinel = [
+    "pystac-client>=0.7",
+    "stackstac>=0.5",
+    "planetary-computer>=1.0",
+]
 dev = [
     "pytest>=8.0",
 ]
@@ -23,6 +31,7 @@ dev = [
 [project.scripts]
 hack26-counties = "engine.counties:_main"
 hack26-cdl = "engine.cdl:_main"
+hack26-weather = "engine.weather.core:_main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
