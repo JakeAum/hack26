@@ -243,10 +243,27 @@ def _resolve_forecast_dates(spec: str) -> list[str]:
 
 
 def _resolve_model_dir(model_dir: str | Path) -> Path:
-    p = Path(model_dir).expanduser().resolve()
-    if not p.exists():
-        raise FileNotFoundError(f"--model-dir does not exist: {p}")
-    return p
+    """Resolve checkpoint directory; bare names use ``<data_root>/derived/models/<name>/``."""
+    from ._logging import _data_root
+
+    raw = Path(model_dir)
+    expanded = raw.expanduser()
+    p = expanded.resolve()
+    if p.is_dir():
+        return p
+    if not expanded.is_absolute() and len(expanded.parts) == 1:
+        alt = (_data_root() / "derived" / "models" / expanded.parts[0]).resolve()
+        if alt.is_dir():
+            return alt
+    if p.is_file():
+        raise FileNotFoundError(f"--model-dir is a file, not a directory: {p}")
+    extra = ""
+    if not expanded.is_absolute() and len(expanded.parts) == 1:
+        conv = (
+            _data_root() / "derived" / "models" / expanded.parts[0]
+        ).resolve()
+        extra = f"\n  (also checked: {conv!s})"
+    raise FileNotFoundError(f"--model-dir does not exist: {p}{extra}")
 
 
 def _checkpoint_path(model_dir: Path, forecast_date: str) -> Path:

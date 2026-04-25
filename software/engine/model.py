@@ -400,7 +400,14 @@ def load_tft(path: Path):
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"no model at {path}")
-    model = TFTModel.load(str(path))
+    # PyTorch 2.6+ defaults torch.load(weights_only=True). Lightning's
+    # load_from_checkpoint (used for the .pt sidecar .ckpt) would then
+    # refuse to unpickle Darts types (e.g. QuantileRegression). Our paths are
+    # from our own training runs — full unpickle is required.
+    try:
+        model = TFTModel.load(str(path), weights_only=False)
+    except TypeError:
+        model = TFTModel.load(str(path))
     sidecar = path.with_suffix(path.suffix + ".meta.json")
     if sidecar.exists():
         with open(sidecar, encoding="utf-8") as fh:
