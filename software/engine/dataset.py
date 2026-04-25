@@ -216,7 +216,7 @@ class TrainingBundle:
 # Training bundle on-disk cache (for hack26-dataset → hack26-train)
 # ---------------------------------------------------------------------------
 
-BUNDLE_META_VERSION: int = 1
+BUNDLE_META_VERSION: int = 2  # bumped: enforce float32 covariates / statics
 LAST_BUNDLE_PKL: str = "last_training_bundle.pkl"
 LAST_BUNDLE_META: str = "last_training_bundle.meta.json"
 
@@ -465,10 +465,10 @@ def _build_calendar_frame(
     month = dates.month.to_numpy().astype(np.int32)
     return pd.DataFrame(
         {
-            "doy_sin": np.sin(2 * np.pi * doy / 366.0),
-            "doy_cos": np.cos(2 * np.pi * doy / 366.0),
-            "week_sin": np.sin(2 * np.pi * week / 53.0),
-            "week_cos": np.cos(2 * np.pi * week / 53.0),
+            "doy_sin": np.sin(2 * np.pi * doy / 366.0).astype(np.float32),
+            "doy_cos": np.cos(2 * np.pi * doy / 366.0).astype(np.float32),
+            "week_sin": np.sin(2 * np.pi * week / 53.0).astype(np.float32),
+            "week_cos": np.cos(2 * np.pi * week / 53.0).astype(np.float32),
             "month": month.astype(np.float32),
             "days_until_end_of_season":
                 (season_end_doy - doy).astype(np.float32),
@@ -736,7 +736,9 @@ def _build_series_for_county_year(
     past_df = _impute_past_block(weather_block, past_cols)
     future_df = _build_calendar_frame(season_dates, season_end_doy=season_end_doy)
 
-    static_df = pd.DataFrame([static_row], index=[0])
+    # Darts' TFT runs in float32; mixed-precision inputs raise
+    # "expected m1 and m2 to have the same dtype" in the prescaler Linear layer.
+    static_df = pd.DataFrame([static_row], index=[0]).astype(np.float32)
 
     target_values = np.full(
         (len(season_dates), 1), float(label), dtype=np.float32
@@ -746,6 +748,9 @@ def _build_series_for_county_year(
         index=season_dates,
         columns=["yield_bu_acre"],
     )
+
+    past_df = past_df.astype(np.float32)
+    future_df = future_df.astype(np.float32)
 
     target_ts = TimeSeries.from_dataframe(
         target_df,
