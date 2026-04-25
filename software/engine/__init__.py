@@ -16,6 +16,10 @@ __all__ = [
     "fetch_counties_cdl",
     "fetch_county_weather",
     "fetch_counties_weather",
+    "fetch_county_nass_yields",
+    "fetch_counties_nass_yields",
+    "fetch_nass_state_corn_forecasts",
+    "nass_get",
 ]
 
 # Lazy re-exports so `python -m engine.<sub>` doesn't double-import the
@@ -28,6 +32,13 @@ _LAZY: dict[str, tuple[str, str]] = {
     "fetch_counties_cdl":      ("engine.cdl",            "fetch_counties_cdl"),
     "fetch_county_weather":    ("engine.weather.core",   "fetch_county_weather"),
     "fetch_counties_weather":  ("engine.weather.core",   "fetch_counties_weather"),
+    "fetch_county_nass_yields":   ("engine.nass.core", "fetch_county_nass_yields"),
+    "fetch_counties_nass_yields": ("engine.nass.core", "fetch_counties_nass_yields"),
+    "fetch_nass_state_corn_forecasts": (
+        "engine.nass.core",
+        "fetch_nass_state_corn_forecasts",
+    ),
+    "nass_get": ("engine.nass.core", "nass_get"),
 }
 
 
@@ -43,4 +54,10 @@ def __getattr__(name: str) -> Any:
 if TYPE_CHECKING:
     from engine.cdl import fetch_counties_cdl, fetch_county_cdl, load_cdl  # noqa: F401
     from engine.counties import load_counties  # noqa: F401
+    from engine.nass.core import (  # noqa: F401
+        fetch_counties_nass_yields,
+        fetch_county_nass_yields,
+        fetch_nass_state_corn_forecasts,
+        nass_get,
+    )
     from engine.weather.core import fetch_counties_weather, fetch_county_weather  # noqa: F401

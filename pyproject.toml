@@ -32,6 +32,7 @@ dev = [
 hack26-counties = "engine.counties:_main"
 hack26-cdl = "engine.cdl:_main"
 hack26-weather = "engine.weather.core:_main"
+hack26-nass = "engine.nass.core:_main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

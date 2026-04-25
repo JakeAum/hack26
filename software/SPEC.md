@@ -21,7 +21,7 @@ flowchart TD
         CDL["CDL corn mask (built)"]
         WX["Weather<br/>POWER + SMAP + Sentinel-2 (built)"]
         HLS["Imagery — HLS"]:::planned
-        NASS["NASS yields<br/>(ground truth)"]:::planned
+        NASS["NASS / Quick Stats<br/>(built)"]
     end
 
     Engine -->|feature frame<br/>ROI × season × as-of date| Model["Model + Analogs"]:::planned
@@ -344,6 +344,66 @@ sequenceDiagram
 - No backfill of older Sentinel/SMAP — pre-2015 dates just yield NaN for
   those columns; POWER alone covers 1981+.
 
+### 6.5 Component: NASS / Quick Stats `engine.nass`
+
+**Purpose.** Pull **published** corn-for-grain **yield (bu/acre)** from the USDA
+[NASS Quick Stats API](https://quickstats.nass.usda.gov/) for (a) **county
+finals** (training labels) and (b) **state** Aug/Sep/Oct/Nov in-season
+forecasts + annual final (USDA’s public forecast line for comparison / loss).
+
+**Source.** Quick Stats `api_GET` (JSON) — `SURVEY`, `CORN` / `GRAIN`, `YIELD`
+/ `BU / ACRE`, `agg_level` `COUNTY` (reference `YEAR` only) or `STATE` (ref
+`YEAR - AUG FORECAST` … `YEAR`).
+
+**Auth.** Free API key — environment variable `NASS_API_KEY` (register at
+Quick Stats; never commit the key). CLI fails fast with a clean argument error
+if the key is missing.
+
+**Output (county).** One row per `(geoid, year)`: `nass_value` (float bu/acre),
+`reference_period_desc` (`YEAR` for the annual final), `load_time` (NASS
+publication), plus Quick Stats–aligned id columns. Rows that roll up
+suppressed counties (`OTHER (COMBINED) COUNTIES` / FIPS 998) are **dropped** so
+joins to the County Catalog stay 1:1.
+
+**Output (state).** State rows use a synthetic 5-char key `geoid` =
+`<2-digit state FIPS>000` (e.g. `19000` = Iowa) — it is not a real county; use
+`agg_level_desc=STATE` to tell them from county training rows.
+
+**On-disk cache.** `~/hack26/data/derived/nass/corn_*.parquet` (or
+`$HACK26_CDL_DATA_DIR/derived/nass/`), one parquet per (state, year range).
+
+**Validation.**
+- All public fetchers validate `start_year <= end_year` and raise `ValueError`
+  for invalid ranges.
+- County fetchers require 5-digit county FIPS `geoid` values.
+
+**Public API.**
+```python
+from engine.nass import (
+    fetch_county_nass_yields,
+    fetch_counties_nass_yields,
+    fetch_nass_state_corn_forecasts,
+)
+
+# County finals — geometry ignored (FIPS + year only)
+df_c = fetch_county_nass_yields("19169", None, 2020, 2022)
+
+# Many counties
+from engine.counties import load_counties
+gdf = load_counties(states=["Iowa"])
+df = fetch_counties_nass_yields(gdf, 2018, 2024)
+
+# State baseline
+df_s = fetch_nass_state_corn_forecasts()  # all 5 project states, default years
+df_s2 = fetch_nass_state_corn_forecasts(
+    state_fips_list=["19", "31"], start_year=2020, end_year=2024
+)
+```
+
+**Non-goals.** NASS *does not* publish county in-season forecast rows; only
+`YEAR` exists at the county. Our model is free to output county+forecast; this
+source provides labels + a state official baseline only.
+
 ## 7. Repository layout
 
 ```
@@ -356,6 +416,11 @@ hack26/
 │   │   ├── __init__.py         # lazy re-exports for all built sources
 │   │   ├── counties.py         # County Catalog implementation + CLI
 │   │   ├── cdl.py              # CDL Corn Mask implementation + CLI
+│   │   ├── nass/               # NASS Quick Stats (yields, state forecasts)
+│   │   │   ├── __init__.py
+│   │   │   ├── __main__.py
+│   │   │   ├── _cache.py
+│   │   │   └── core.py
 │   │   └── weather/
 │   │       ├── __init__.py     # lazy re-exports
 │   │       ├── __main__.py     # python -m engine.weather
@@ -367,13 +432,14 @@ hack26/
 │   └── tests/
 │       ├── test_counties_smoke.py
 │       ├── test_cdl_smoke.py
+│       ├── test_nass_smoke.py
 │       └── test_weather_smoke.py
 └── .venv/                      # local environment (gitignored)
 ```
 
 Local caches (gitignored, live outside the repo):
 - `~/.hack26/tiger/` — TIGER zip + 5-state GeoParquet (county catalog only).
-- `~/hack26/data/` — single source of truth for CDL. Pre-extracted national rasters live here on the AWS workshop machine; `derived/` holds our per-county feature parquets. The CDL engine never writes to `~/.hack26/`.
+- `~/hack26/data/` — single source of truth for CDL. Pre-extracted national rasters live here on the AWS workshop machine; `derived/` holds feature caches for CDL, weather, and NASS. The CDL engine never writes to `~/.hack26/`.
 
 ## 8. Operations
 
@@ -466,25 +532,44 @@ Notes:
 - `--sleep 0` to disable the 1 s pause between live POWER calls when
   pulling many counties (cached counties skip the sleep automatically).
 
-### 8.5 Tests
+### 8.5 Running the NASS / Quick Stats source
+
+Set `NASS_API_KEY` first (see §8.9). Caches to `~/hack26/data/derived/nass/`.
+
+```powershell
+.venv\Scripts\python.exe -m engine.nass --counties --states Iowa --start 2018 --end 2023 --out ia_yields.csv
+.venv\Scripts\python.exe -m engine.nass --state-forecasts --start 2018 --end 2024 --out state_f.csv
+.venv\Scripts\python.exe -m engine.nass --state-forecasts --states 19 31 --start 2020 --end 2023
+```
+
+Console-script: `hack26-nass` (after editable install), same flags.
+
+CLI requires exactly one of `--counties` / `--state-forecasts` (mutually
+exclusive). `--state-forecasts` with no `--states` queries all five project
+states from the County Catalog. Invalid ranges (`--start > --end`) are rejected
+at parse time.
+
+### 8.6 Tests
 
 ```powershell
 .venv\Scripts\python.exe -m pytest software\tests -v
 ```
 
-Three smoke tests:
+Four smoke tests:
 - `software/tests/test_counties_smoke.py` — loads Colorado, eyeballs the first 5 counties, asserts schema + filter + geometry validity + centroid-in-CO-bbox. First run ~10 s (TIGER download); cached <1 s.
 - `software/tests/test_cdl_smoke.py` — runs `fetch_counties_cdl` against the first 5 Iowa counties and asserts schema + per-county corn fraction is in a sane Iowa range (5–85 %). **Auto-skips** when rasterio isn't installed or no national CDL `.tif` is reachable on disk, so it never triggers a multi-GB download from a CI pipe.
+- `software/tests/test_nass_smoke.py` — value parsing, county-row normalization, state-forecast normalization, year-range validation, and missing-key error; **one optional live** Story County, IA 2020 pull when `NASS_API_KEY` is set. CI is fully offline.
 - `software/tests/test_weather_smoke.py` — pulls one year of NASA POWER for Story County, IA and asserts the SPEC §2 contract (`(date, geoid)` index, GDD/GDD_cumulative present, sane Iowa GDD range) plus a back-to-back consistency check that two identical calls return byte-identical frames. Sentinel-2 skipped to keep CI offline-friendly.
 
 Standalone form (each test file is also runnable with `python -m`):
 ```powershell
 .venv\Scripts\python.exe software\tests\test_counties_smoke.py
 .venv\Scripts\python.exe software\tests\test_cdl_smoke.py
+.venv\Scripts\python.exe software\tests\test_nass_smoke.py
 .venv\Scripts\python.exe software\tests\test_weather_smoke.py
 ```
 
-### 8.6 Refreshing the dependency lock
+### 8.7 Refreshing the dependency lock
 
 When `pyproject.toml`'s `[project.dependencies]` or `[project.optional-dependencies]` change (e.g. when `rasterio` was added for the CDL source):
 
@@ -493,7 +578,7 @@ python -m uv pip compile pyproject.toml -o software\requirements.txt
 python -m uv pip compile pyproject.toml --extra dev -o software\requirements-dev.txt
 ```
 
-### 8.7 Refreshing source caches
+### 8.8 Refreshing source caches
 
 TIGER (county catalog):
 ```powershell
@@ -512,6 +597,8 @@ python -m engine.weather --states Iowa --start 2020 --end 2024 --refresh
 rm -rf ~/hack26/data/derived/weather/                                          # wipe everything
 ```
 
+NASS — delete `~/hack26/data/derived/nass/*.parquet` or re-run the CLI with `--refresh` to re-query Quick Stats for the same year span.
+
 Or, to start fully clean (TIGER + Iowa GeoParquet only — does NOT touch the CDL or weather data roots):
 ```powershell
 Remove-Item -Recurse -Force $HOME\.hack26
@@ -522,9 +609,10 @@ To wipe CDL outputs (keep the rasters, drop the derived parquets):
 rm -rf ~/hack26/data/derived/
 ```
 
-### 8.8 Environment variables
+### 8.9 Environment variables
 
 | Var                  | Default              | Effect                                                        |
 | -------------------- | -------------------- | ------------------------------------------------------------- |
 | `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for the County Catalog (TIGER) cache. Also the **fallback** root for `engine.weather` parquet caches when `HACK26_CDL_DATA_DIR` isn't set. Not used by the CDL engine. |
-| `HACK26_CDL_DATA_DIR`| `~/hack26/data`      | **CDL data root.** Single source of truth for rasters AND derived parquet outputs (CDL + weather). Must already exist for the CDL engine, which raises `FileNotFoundError` instead of falling back anywhere else; weather auto-creates it. |
+| `HACK26_CDL_DATA_DIR`| `~/hack26/data`      | **CDL data root.** Single source of truth for rasters AND derived parquet outputs (CDL, weather, NASS). Must already exist for the CDL engine, which raises `FileNotFoundError` instead of falling back anywhere else; weather and NASS auto-create it. |
+| `NASS_API_KEY`       | (unset)              | **Required** for `engine.nass` — NASS [Quick Stats API](https://quickstats.nass.usda.gov/api) key (free; never commit the value). |
