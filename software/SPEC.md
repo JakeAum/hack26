@@ -18,8 +18,8 @@ flowchart TD
     subgraph Engine["Engine — pluggable data sources"]
         direction LR
         Counties["counties (built)"]
+        CDL["CDL corn mask (built)"]
         HLS["Imagery — HLS"]:::planned
-        CDL["CDL corn mask"]:::planned
         WX["Weather<br/>POWER / ERA5 / GEFS"]:::planned
         SM["Soil moisture — SMAP"]:::planned
         NASS["NASS yields<br/>(ground truth)"]:::planned
@@ -123,7 +123,116 @@ The cache has two layers: the raw TIGER zip (so a refresh can rebuild without re
 - No sub-county geometries.
 - No alternate vintages — TIGER 2024 is pinned via `TIGER_YEAR` in `engine/counties.py`.
 
-## 5. Repository layout
+## 5. Component: CDL Corn Mask `engine.cdl`
+
+**Purpose.** Project the USDA Cropland Data Layer national raster down to per-county corn statistics keyed on `geoid`, so it slots straight into the SPEC §2 Engine contract and joins against the County Catalog without any glue.
+
+**Source.** USDA NASS Cropland Data Layer — annual, geo-referenced, crop-specific raster covering CONUS. Available years and resolutions:
+
+| Resolution | Years     | Note                                                          |
+| ---------- | --------- | ------------------------------------------------------------- |
+| 30 m       | 2008–2025 | Resampled from the 10 m product for 2024+; native for ≤2023.  |
+| 10 m       | 2024–2025 | Native generation; ~9.8 GB zipped, ~14.9 GB extracted (2025). |
+
+Downloads go through one of two endpoints:
+- **NASS HTTPS** — `https://www.nass.usda.gov/Research_and_Science/Cropland/Release/datasets/{year}_{res}m_cdls.zip`. Default. Covers every (year, resolution) combination above.
+- **Workshop S3 mirror** — `s3://rayette.guru/workshop/2025_10m_cdls.zip`, anonymous read via `aws s3 cp --no-sign-request`. Only hosts 2025 10 m. Used automatically when running on the AWS sagemaker box for that one combo (faster in-region transfer); otherwise NASS is used.
+
+**Output schema** (one row per county, returned by `fetch_counties_cdl`):
+
+| Column                  | Type    | Notes                                                              |
+| ----------------------- | ------- | ------------------------------------------------------------------ |
+| `geoid`                 | str (5) | Join key — matches the County Catalog.                             |
+| `year`                  | int     | CDL vintage.                                                       |
+| `resolution_m`          | int     | 10 or 30.                                                          |
+| `pixel_area_m2`         | int     | `resolution_m ** 2`. Surfaced so callers don't have to recompute.  |
+| `total_pixels`          | int     | All non-background pixels inside the county polygon.               |
+| `cropland_pixels`       | int     | Excludes water, developed, forest, wetlands (CDL classes 63–64, 81–92, 111–195). |
+| `corn_pixels`           | int     | CDL class 1 (corn-for-grain — the replacement target).             |
+| `sweet_corn_pixels`     | int     | CDL class 12.                                                      |
+| `pop_orn_corn_pixels`   | int     | CDL class 13.                                                      |
+| `soybean_pixels`        | int     | CDL class 5. Surfaced because corn↔soy rotation is a strong predictor. |
+| `corn_area_m2`          | int     | `corn_pixels * pixel_area_m2`.                                     |
+| `soybean_area_m2`       | int     | `soybean_pixels * pixel_area_m2`.                                  |
+| `corn_pct_of_county`    | float   | `corn_pixels / total_pixels`. Comparable across counties of different cropland intensity. |
+| `corn_pct_of_cropland`  | float   | `corn_pixels / cropland_pixels`. Better for yield-weighted aggregation. |
+
+**Public API.**
+```python
+from engine.cdl import load_cdl, fetch_county_cdl, fetch_counties_cdl
+from engine.counties import load_counties
+
+tif = load_cdl(year=2025, resolution=10)                   # Path to national GeoTIFF
+df  = fetch_counties_cdl(load_counties(states=["Iowa"]),   # one row per county
+                         year=2025, resolution=10)
+row = fetch_county_cdl(geoid="19169", geometry=poly,       # single-county form
+                       year=2024, resolution=30)
+```
+
+`load_cdl(year, resolution)` validates the (year, resolution) combo against the matrix above and raises `ValueError` for unsupported pairs (e.g. 2019 at 10 m).
+
+**Data discovery.** `load_cdl` probes these locations *in order* before triggering a download. This is how the AWS sagemaker workshop machine reuses its pre-extracted 14.9 GB EFS copy instead of pulling another 9.8 GB:
+
+1. `$HACK26_CDL_DATA_DIR/{year}_{res}m_cdls.tif` — explicit env override.
+2. `~/hack26/data/{year}_{res}m_cdls.tif` — the documented EFS mount per the README.
+3. `~/.hack26/cdl/{year}_{res}m_cdls.tif` — our own download cache.
+4. Download zip → extract → step 3.
+
+**Call flow.**
+
+```mermaid
+sequenceDiagram
+    participant Caller as Caller (CLI / Engine)
+    participant CDL as load_cdl()
+    participant EFS as EFS mount<br/>(~/hack26/data)
+    participant Cache as Local cache<br/>(~/.hack26/cdl/)
+    participant S3 as Workshop S3<br/>(2025 10 m only)
+    participant NASS as NASS HTTPS<br/>(2008-2025)
+
+    Caller->>CDL: load_cdl(year, resolution)
+    CDL->>EFS: {year}_{res}m_cdls.tif present?
+    alt EFS hit
+        EFS-->>Caller: Path (no I/O)
+    else EFS miss
+        CDL->>Cache: extracted .tif present?
+        alt cache hit
+            Cache-->>Caller: Path
+        else cache miss
+            CDL->>Cache: zip present?
+            alt zip miss
+                alt year=2025, res=10, aws CLI present
+                    CDL->>S3: anonymous GET
+                    S3-->>Cache: zip
+                else
+                    CDL->>NASS: GET
+                    NASS-->>Cache: zip
+                end
+            end
+            CDL->>Cache: extract .tif (+ .ovr / .aux sidecars)
+            Cache-->>Caller: Path
+        end
+    end
+```
+
+`fetch_counties_cdl` opens the national raster once, reprojects each county polygon from EPSG:4269 (NAD83) to the CDL's CONUS Albers CRS via `rasterio.warp.transform_geom`, and runs `rasterio.mask` per county to get a 256-bin pixel-class histogram. The output frame is cached as `~/.hack26/cdl/county_features_{year}_{res}m_{nrows}_{geoid_hash}.parquet` (the hash is a 12-char SHA-1 prefix over the sorted `geoid` list, so different county sets of the same size — e.g. 5 Iowa counties vs 5 Colorado counties — never share a cache file) so a repeat call with the same county set is a sub-second parquet read.
+
+**Cache layout.**
+```
+~/.hack26/cdl/
+├── 2025_10m_cdls.zip                   # raw NASS / workshop download (only if EFS missed)
+├── 2025_10m_cdls.tif                   # extracted national raster
+├── 2025_10m_cdls.tif.ovr               # overview pyramid sidecar
+└── county_features_2025_10m_99_3f7a9c1b2e4d.parquet # per-county aggregation (Iowa example; suffix is sha1(sorted geoids)[:12])
+```
+
+`refresh=True` only ever clobbers files in `~/.hack26/cdl/`. Pre-mounted EFS rasters at `~/hack26/data/` are treated read-only.
+
+**Non-goals.**
+- No raster reprojection — we always warp the county polygon to CDL Albers, never the other way around (a national 10 m reproject would be a tens-of-GB operation per call).
+- No sub-county aggregation — `fetch_county_cdl` accepts an arbitrary polygon, so field-level callers plug in via the same function; the per-state CLI just wraps the county geometry case.
+- No confidence-layer ingest — NASS publishes a separate `{year}_30m_Confidence_Layer.zip`; out of scope for the MVP.
+
+## 6. Repository layout
 
 ```
 hack26/
@@ -132,18 +241,23 @@ hack26/
 │   ├── requirements.txt     # locked runtime deps (uv pip compile output)
 │   ├── requirements-dev.txt # locked runtime + dev deps
 │   ├── engine/
-│   │   ├── __init__.py      # re-exports load_counties
-│   │   └── counties.py      # County Catalog implementation + CLI
+│   │   ├── __init__.py      # lazy re-exports for all built sources
+│   │   ├── counties.py      # County Catalog implementation + CLI
+│   │   └── cdl.py           # CDL Corn Mask implementation + CLI
 │   └── tests/
-│       └── test_counties_smoke.py
+│       ├── test_counties_smoke.py
+│       └── test_cdl_smoke.py
 └── .venv/                   # local environment (gitignored)
 ```
 
-Local cache (gitignored, lives outside the repo): `~/.hack26/tiger/`.
+Local caches (gitignored, live outside the repo):
+- `~/.hack26/tiger/` — TIGER zip + 5-state GeoParquet.
+- `~/.hack26/cdl/` — CDL zips, extracted GeoTIFFs, per-county feature parquets.
+- `~/hack26/data/` — read-only EFS mount on the AWS workshop machine; pre-extracted national CDL rasters live here.
 
-## 6. Operations
+## 7. Operations
 
-### 6.1 First-time environment setup
+### 7.1 First-time environment setup
 
 Requires Python ≥ 3.11. `uv` is recommended for speed but optional.
 
@@ -163,7 +277,7 @@ pip install -r software/requirements.txt
 pip install -e .   # registers the `engine` package
 ```
 
-### 6.2 Running the County Catalog
+### 7.2 Running the County Catalog
 
 Module form:
 ```powershell
@@ -178,43 +292,75 @@ Console-script form (after editable install):
 .venv\Scripts\hack26-counties.exe --states Iowa
 ```
 
-### 6.3 Tests
+### 7.3 Running the CDL Corn Mask
+
+Intended to run on the AWS sagemaker workshop instance — the 14.9 GB 2025 10 m raster is already on the EFS mount at `~/hack26/data/`, so the first call only does per-county masking, not a download.
+
+Module form:
+```bash
+python -m engine.cdl                                    # 2025, 30 m, all 5 states
+python -m engine.cdl --year 2024 --resolution 30        # any historical year (2008-2025 @ 30 m)
+python -m engine.cdl --year 2025 --resolution 10        # uses EFS .tif if present, else downloads
+python -m engine.cdl --states Iowa Colorado             # subset
+python -m engine.cdl --refresh                          # re-download zip + re-aggregate
+python -m engine.cdl --download-only                    # fetch + extract only, skip masking
+python -m engine.cdl --source nass                      # force NASS HTTPS (default is auto)
+python -m engine.cdl --source workshop                  # force s3://rayette.guru (2025 10 m only)
+python -m engine.cdl --out cdl_features.parquet         # also export (.parquet or .csv)
+```
+
+Console-script form (after editable install):
+```bash
+hack26-cdl --year 2025 --resolution 10 --states Iowa
+```
+
+Expected runtime on the AWS box (2025 10 m, all 5 states / 443 counties): ~minutes for the first cold pass; sub-second for cached re-reads (parquet at `~/.hack26/cdl/county_features_2025_10m_443_<hash>.parquet`).
+
+### 7.4 Tests
 
 ```powershell
 .venv\Scripts\python.exe -m pytest software\tests -v
 ```
 
-The smoke test (`software/tests/test_counties_smoke.py`) loads Colorado, eyeballs the first 5 counties, and asserts schema + filter + geometry validity + centroid-in-CO-bbox. Standalone form prints a human-readable report:
+Two smoke tests:
+- `software/tests/test_counties_smoke.py` — loads Colorado, eyeballs the first 5 counties, asserts schema + filter + geometry validity + centroid-in-CO-bbox. First run ~10 s (TIGER download); cached <1 s.
+- `software/tests/test_cdl_smoke.py` — runs `fetch_counties_cdl` against the first 5 Iowa counties and asserts schema + per-county corn fraction is in a sane Iowa range (5–85 %). **Auto-skips** when rasterio isn't installed or no national CDL `.tif` is reachable on disk, so it never triggers a multi-GB download from a CI pipe.
 
+Standalone form (each test file is also runnable with `python -m`):
 ```powershell
 .venv\Scripts\python.exe software\tests\test_counties_smoke.py
+.venv\Scripts\python.exe software\tests\test_cdl_smoke.py
 ```
 
-Expected first run: ~10 s (TIGER download). Cached runs: <1 s.
+### 7.5 Refreshing the dependency lock
 
-### 6.4 Refreshing the dependency lock
-
-When `pyproject.toml`'s `[project.dependencies]` or `[project.optional-dependencies]` change:
+When `pyproject.toml`'s `[project.dependencies]` or `[project.optional-dependencies]` change (e.g. when `rasterio` was added for the CDL source):
 
 ```powershell
 python -m uv pip compile pyproject.toml -o software\requirements.txt
 python -m uv pip compile pyproject.toml --extra dev -o software\requirements-dev.txt
 ```
 
-### 6.5 Refreshing the TIGER cache
+### 7.6 Refreshing source caches
 
+TIGER (county catalog):
 ```powershell
 .venv\Scripts\python.exe -m engine.counties --refresh
 ```
 
-Or, to start fully clean:
+CDL (only files in `~/.hack26/cdl/` — pre-mounted EFS rasters at `~/hack26/data/` are read-only and ignored):
+```bash
+python -m engine.cdl --year 2025 --resolution 30 --refresh
+```
 
+Or, to start fully clean:
 ```powershell
 Remove-Item -Recurse -Force $HOME\.hack26
 ```
 
-### 6.6 Environment variables
+### 7.7 Environment variables
 
 | Var                  | Default              | Effect                                                        |
 | -------------------- | -------------------- | ------------------------------------------------------------- |
-| `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for all source caches. `tiger/` subdir created underneath. |
+| `HACK26_CACHE_DIR`   | `~/.hack26`          | Root for all source caches. `tiger/` and `cdl/` subdirs created underneath. |
+| `HACK26_CDL_DATA_DIR`| *(unset)*            | First location probed for an already-extracted CDL `{year}_{res}m_cdls.tif`. Use this on the AWS box to point at a non-default EFS mount. Falls back to `~/hack26/data/` then `$HACK26_CACHE_DIR/cdl/`. |

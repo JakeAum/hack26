@@ -9,16 +9,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__all__ = ["load_counties"]
+__all__ = ["load_counties", "load_cdl", "fetch_county_cdl", "fetch_counties_cdl"]
 
-# Lazy re-export so `python -m engine.counties` doesn't double-import the
-# submodule (which triggers a runpy RuntimeWarning).
+# Lazy re-exports so `python -m engine.<sub>` doesn't double-import the
+# submodule (which triggers a runpy RuntimeWarning), and so importing the
+# package doesn't pull rasterio / geopandas into memory unnecessarily.
+_LAZY: dict[str, tuple[str, str]] = {
+    "load_counties":      ("engine.counties", "load_counties"),
+    "load_cdl":           ("engine.cdl",      "load_cdl"),
+    "fetch_county_cdl":   ("engine.cdl",      "fetch_county_cdl"),
+    "fetch_counties_cdl": ("engine.cdl",      "fetch_counties_cdl"),
+}
+
+
 def __getattr__(name: str) -> Any:
-    if name == "load_counties":
-        from engine.counties import load_counties
-        return load_counties
-    raise AttributeError(f"module 'engine' has no attribute {name!r}")
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module 'engine' has no attribute {name!r}")
+    mod_name, attr = target
+    import importlib
+    return getattr(importlib.import_module(mod_name), attr)
 
 
 if TYPE_CHECKING:
+    from engine.cdl import fetch_counties_cdl, fetch_county_cdl, load_cdl  # noqa: F401
     from engine.counties import load_counties  # noqa: F401
