@@ -64,21 +64,31 @@ logger = get_logger(__name__)
 
 
 def _import_tft_model():
-    """Import :class:`darts.models.forecasting.tft_model.TFTModel` directly.
+    """Return :class:`darts.models.forecasting.tft_model.TFTModel`.
 
-    Importing the public ``darts.models`` package eagerly loads every model
-    in Darts' registry, including ``catboost_model``, which transitively
-    imports the ``catboost`` C extension. On environments where ``catboost``
-    was built against a different numpy ABI (a common mismatch on the AWS
-    SageMaker conda image), that import raises::
-
-        ValueError: numpy.dtype size changed, may indicate binary
-        incompatibility. Expected 96 from C header, got 88 from PyObject
-
-    even though we never use CatBoost. Importing the leaf submodule skips
-    the registry sweep and avoids the issue.
+    Darts' ``darts.models`` package ``__init__`` import graph pulls in
+    ``catboost`` even for TFT-only use. A ``catboost`` wheel that was built
+    against a different NumPy ABI (common on mixed conda + pip images) can
+    raise a ``ValueError`` at import. We declare ``catboost`` in the
+    ``[forecast]`` extra so resolvers can install a current wheel; if it still
+    fails, ``pip install -U 'catboost>=1.2.5'`` or match NumPy to the wheel
+    (e.g. ``pip install 'numpy<2'``) fixes it. Importing a leaf submodule
+    does *not* skip ``darts.models``'s ``__init__`` — that is a parent package.
     """
-    from darts.models.forecasting.tft_model import TFTModel
+    try:
+        from darts.models.forecasting.tft_model import TFTModel
+    except ValueError as e:
+        msg = str(e)
+        if "numpy.dtype" in msg or "incompatibility" in msg.lower():
+            raise RuntimeError(
+                "Darts imported CatBoost, but the CatBoost binary does not match "
+                "this NumPy build (common on SageMaker/conda). Try:\n"
+                "  pip install -U 'catboost>=1.2.5'\n"
+                "or align NumPy to 1.26 line:\n"
+                "  pip install 'numpy>=1.26,<2.0.0'\n"
+                f"Original error: {e!r}"
+            ) from e
+        raise
     return TFTModel
 
 # ---------------------------------------------------------------------------

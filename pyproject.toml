@@ -28,6 +28,9 @@ sentinel = [
 # and the engine is fully usable for data assembly without it.
 forecast = [
     "darts>=0.30",
+    # darts.models eagerly imports this; a stale wheel vs NumPy 2 raises
+    # "numpy.dtype size changed" at import. Pin so pip can resolve a current wheel.
+    "catboost>=1.2.5",
     "torch>=2.2",
     "pytorch-lightning>=2.2",
     "scikit-learn>=1.4",
