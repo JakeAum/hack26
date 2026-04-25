@@ -1,0 +1,239 @@
+{
+  "workspaces": {
+    "@ Simulation Workbench": {
+      "main": {
+        "id": "0745e9a47c8895df",
+        "type": "split",
+        "children": [
+          {
+            "id": "414991bab91e43e4",
+            "type": "tabs",
+            "children": [
+              {
+                "id": "cc862b6565161f4b",
+                "type": "leaf",
+                "state": {
+                  "type": "canvas",
+                  "state": {
+                    "file": "Simulation.canvas",
+                    "viewState": {
+                      "x": 283.075635364261,
+                      "y": -1045.7372783709393,
+                      "zoom": -2.1742582101279098
+                    }
+                  },
+                  "icon": "lucide-layout-dashboard",
+                  "title": "Simulation"
+                }
+              },
+              {
+                "id": "11444e1c4307357a",
+                "type": "leaf",
+                "state": {
+                  "type": "webviewer",
+                  "state": {
+                    "url": "https://drive.google.com/drive/folders/1-cKpkG2N9sYTWR_MBSGQmqTR86uDVlei",
+                    "title": "@ Simulations - Google Drive",
+                    "mode": "webview"
+                  },
+                  "icon": "globe-2",
+                  "title": "@ Simulations - Google Drive"
+                }
+              },
+              {
+                "id": "f1972aa1fe6bfa59",
+                "type": "leaf",
+                "state": {
+                  "type": "webviewer",
+                  "state": {
+                    "url": "https://www.simscale.com/dashboard/spaces/c1f84a2f-c059-4771-acbf-a069be283ca5/folders/bda7bad4-0a4c-422a-bf70-dee8011bf2fe",
+                    "title": "SimScale Dashboard - Your Simulations and Activity Overview",
+                    "mode": "webview"
+                  },
+                  "icon": "globe-2",
+                  "title": "SimScale Dashboard - Your Simulations and Activity Overview"
+                }
+              },
+              {
+                "id": "66f3d24e98399cd9",
+                "type": "leaf",
+                "state": {
+                  "type": "webviewer",
+                  "state": {
+                    "url": "https://cad.onshape.com/documents?nodeId=65ff1bbcded1ce739df8a3d9&resourceType=resourceuserowner",
+                    "title": "Owned by me | Documents",
+                    "mode": "webview"
+                  },
+                  "icon": "globe-2",
+                  "title": "Owned by me | Documents"
+                }
+              }
+            ]
+          }
+        ],
+        "direction": "vertical"
+      },
+      "left": {
+        "id": "7ddba8af95c8acec",
+        "type": "split",
+        "children": [
+          {
+            "id": "8361787153de7db3",
+            "type": "tabs",
+            "children": [
+              {
+                "id": "89439cb92f0bc95d",
+                "type": "leaf",
+                "state": {
+                  "type": "file-explorer",
+                  "state": {
+                    "sortOrder": "alphabetical",
+                    "autoReveal": false
+                  },
+                  "icon": "lucide-folder-closed",
+                  "title": "Files"
+                }
+              },
+              {
+                "id": "ae3ab6322234faa8",
+                "type": "leaf",
+                "state": {
+                  "type": "search",
+                  "state": {
+                    "query": "tag:#delegate/Lia",
+                    "matchingCase": false,
+                    "explainSearch": false,
+                    "collapseAll": false,
+                    "extraContext": false,
+                    "sortOrder": "alphabetical"
+                  },
+                  "icon": "lucide-search",
+                  "title": "Search"
+                }
+              },
+              {
+                "id": "4c81f24ffc791154",
+                "type": "leaf",
+                "state": {
+                  "type": "bookmarks",
+                  "state": {},
+                  "icon": "lucide-bookmark",
+                  "title": "Bookmarks"
+                }
+              }
+            ],
+            "currentTab": 2
+          }
+        ],
+        "direction": "horizontal",
+        "width": 454.50390243530273,
+        "collapsed": true
+      },
+      "right": {
+        "id": "46fbe11aa26c04c8",
+        "type": "split",
+        "children": [
+          {
+            "id": "3add3ea4eeb7244d",
+            "type": "tabs",
+            "children": [
+              {
+                "id": "4944724a214945db",
+                "type": "leaf",
+                "state": {
+                  "type": "outline",
+                  "state": {
+                    "file": "GTD/GTD TASKS.md",
+                    "followCursor": false,
+                    "showSearch": false,
+                    "searchQuery": ""
+                  },
+                  "icon": "lucide-list",
+                  "title": "Outline of GTD TASKS"
+                }
+              },
+              {
+                "id": "36046c7675eb660d",
+                "type": "leaf",
+                "state": {
+                  "type": "tag",
+                  "state": {
+                    "sortOrder": "frequency",
+                    "useHierarchy": true,
+                    "showSearch": false,
+                    "searchQuery": ""
+                  },
+                  "icon": "lucide-tags",
+                  "title": "Tags"
+                }
+              },
+              {
+                "id": "8780e0ba1e67b12c",
+                "type": "leaf",
+                "state": {
+                  "type": "copilot-chat-view",
+                  "state": {},
+                  "icon": "message-square",
+                  "title": "Copilot"
+                }
+              },
+              {
+                "id": "b9f5b73110d72590",
+                "type": "leaf",
+                "state": {
+                  "type": "backlink",
+                  "state": {
+                    "file": "GTD/GTD Projects.md",
+                    "collapseAll": false,
+                    "extraContext": false,
+                    "sortOrder": "alphabetical",
+                    "showSearch": false,
+                    "searchQuery": "",
+                    "backlinkCollapsed": false,
+                    "unlinkedCollapsed": true
+                  },
+                  "icon": "links-coming-in",
+                  "title": "Backlinks for GTD Projects"
+                }
+              },
+              {
+                "id": "e1ffa3b2ac4eb9dd",
+                "type": "leaf",
+                "state": {
+                  "type": "outgoing-link",
+                  "state": {
+                    "file": "GTD/GTD Projects.md",
+                    "linksCollapsed": false,
+                    "unlinkedCollapsed": true
+                  },
+                  "icon": "links-going-out",
+                  "title": "Outgoing links from GTD Projects"
+                }
+              }
+            ],
+            "currentTab": 1
+          }
+        ],
+        "direction": "horizontal",
+        "width": 449.5,
+        "collapsed": true
+      },
+      "left-ribbon": {
+        "hiddenItems": {
+          "omnisearch:Omnisearch": false,
+          "graph:Open graph view": false,
+          "copilot:Open Copilot Chat": false,
+          "command-palette:Open command palette": true,
+          "switcher:Open quick switcher": true,
+          "canvas:Create new canvas": true,
+          "templates:Insert template": true,
+          "obsidian-kanban:Create new board": true,
+          "workspaces:Manage workspace layouts": false
+        }
+      },
+      "active": "cc862b6565161f4b",
+      "mtime": "2025-07-22T18:56:00-06:00"
+    }
+  },
+  "active": "@ Simulation Workbench"
+}

@@ -1,0 +1,11 @@
+.callout[data-callout="note"] {
+    --callout-color: var(--text-accent);
+    background-color: var(--background-primary);
+    border-color: var(--text-accent);
+    border-width: 0.15rem;
+    border-radius: 0.5rem;
+}
+.callout[data-callout="note"] .callout-icon {
+    display: none;
+}
+
