@@ -85,17 +85,30 @@ def _download_tiger(force: bool = False) -> Path:
 
 
 def _resolve_states(states: Iterable[str] | None) -> list[str]:
-    """Accept state names or 2-digit FIPS; return list of FIPS codes."""
+    """Accept state names or 2-digit FIPS; return list of FIPS codes.
+
+    `None` means "all target states" (the documented default). An *empty*
+    iterable is treated as a user error and raises, so callers like
+    ``--states`` with no arguments fail loudly instead of silently returning
+    zero counties.
+    """
     if states is None:
         return list(TARGET_STATES.keys())
 
+    # Materialize once so we can both check emptiness and iterate.
+    requested = [str(s).strip() for s in states]
+    if not requested:
+        raise ValueError(
+            "states must be None (for all 5 target states) or a non-empty "
+            "iterable of state names / 2-digit FIPS; got an empty list"
+        )
+
     out: list[str] = []
-    for s in states:
-        key = str(s).strip()
-        if key in TARGET_STATES:
-            out.append(key)
+    for s in requested:
+        if s in TARGET_STATES:
+            out.append(s)
             continue
-        fips = _NAME_TO_FIPS.get(key.lower())
+        fips = _NAME_TO_FIPS.get(s.lower())
         if fips is None:
             raise ValueError(
                 f"unknown state {s!r}; expected one of "
@@ -174,6 +187,15 @@ def load_counties(
     return gdf
 
 
+def _crs_label(crs) -> str:
+    """Compact CRS label; pyproj's str(crs) is a giant PROJJSON dump."""
+    if crs is None:
+        return "<none>"
+    epsg = crs.to_epsg() if hasattr(crs, "to_epsg") else None
+    name = getattr(crs, "name", "?")
+    return f"EPSG:{epsg} ({name})" if epsg else name
+
+
 def _summarize(gdf: gpd.GeoDataFrame) -> str:
     by_state = (
         gdf.groupby(["state_fips", "state_name"], as_index=False)
@@ -183,8 +205,8 @@ def _summarize(gdf: gpd.GeoDataFrame) -> str:
     )
     lines = [
         f"counties total: {len(gdf)}",
-        f"crs: {gdf.crs}",
-        f"cache: {_parquet_path()}",
+        f"crs:            {_crs_label(gdf.crs)}",
+        f"cache:          {_parquet_path()}",
         "",
         by_state.to_string(index=False),
     ]
@@ -198,8 +220,9 @@ def _main(argv: list[str] | None = None) -> int:
         help="Re-download TIGER and rebuild the parquet cache.",
     )
     parser.add_argument(
-        "--states", nargs="*", default=None,
-        help="Subset (names or FIPS). Default: all 5 target states.",
+        "--states", nargs="+", default=None, metavar="STATE",
+        help="One or more state names or 2-digit FIPS to subset to. "
+             "Omit the flag entirely for all 5 target states.",
     )
     parser.add_argument(
         "--out", type=Path, default=None,

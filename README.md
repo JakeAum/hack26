@@ -1,4 +1,4 @@
-# We❤️ Corn!
+# Will Code for Corn 🌽❤️
 
 ## The Challenge
 

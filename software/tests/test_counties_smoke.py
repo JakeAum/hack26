@@ -11,9 +11,12 @@ Usage:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
-from engine.counties import TARGET_STATES, load_counties
+import pytest
+
+from engine.counties import TARGET_STATES, _crs_label, _resolve_states, load_counties
 
 CO_FIPS = "08"
 EXPECTED_COLS = {
@@ -59,13 +62,27 @@ def test_first_five_colorado_counties() -> None:
         assert row["land_area_m2"] is not None and row["land_area_m2"] > 0
 
 
-def _crs_label(crs) -> str:
-    """Compact CRS label; pyproj's str(crs) is a huge PROJJSON dump."""
-    if crs is None:
-        return "<none>"
-    epsg = crs.to_epsg() if hasattr(crs, "to_epsg") else None
-    name = getattr(crs, "name", "?")
-    return f"EPSG:{epsg} ({name})" if epsg else name
+def test_empty_states_raises() -> None:
+    """Regression: empty --states (or load_counties(states=[])) must fail loudly,
+    not silently return zero counties."""
+    with pytest.raises(ValueError, match="empty"):
+        _resolve_states([])
+    with pytest.raises(ValueError, match="empty"):
+        load_counties(states=[])
+
+
+def test_cli_empty_states_flag_errors_cleanly() -> None:
+    """Regression: `python -m engine.counties --states` (no values) must
+    exit non-zero with a usage error, not silently print 0 counties."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "engine.counties", "--states"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0, (
+        f"expected non-zero exit; got {proc.returncode}\n"
+        f"stdout: {proc.stdout!r}\nstderr: {proc.stderr!r}"
+    )
+    assert "counties total: 0" not in proc.stdout, "regression: silent zero-row output"
 
 
 def _main() -> int:
