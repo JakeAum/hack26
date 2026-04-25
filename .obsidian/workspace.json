@@ -18,40 +18,12 @@
             }
           },
           {
-            "id": "6b89db20b79f015d",
+            "id": "8de7ec4a22f44723",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "README.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "README"
-            }
-          },
-          {
-            "id": "d70a9cdb2076c866",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Data Source Information.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Data Source Information"
-            }
-          },
-          {
-            "id": "c57ad82ec348c15f",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Sentinal.md",
+                "file": "documentation/Sentinal.md",
                 "mode": "source",
                 "source": false
               },
@@ -60,7 +32,7 @@
             }
           }
         ],
-        "currentTab": 3
+        "currentTab": 1
       }
     ],
     "direction": "vertical"
@@ -222,11 +194,21 @@
       "omnisearch:Omnisearch": false
     }
   },
-  "active": "c57ad82ec348c15f",
+  "active": "8de7ec4a22f44723",
   "lastOpenFiles": [
-    "Sentinal.md",
-    "Data Source Information.md",
     "README.md",
+    "software",
+    "documentation/onboarding.md",
+    "documentation/CSU Hackathon - Geospatial AI Crop Yield Forecasting_FINAL.pdf",
+    "Sentinal.md",
+    "documentation/Sentinal.md",
+    "documentation/README.md",
+    "documentation/problem statement.md",
+    "documentation/Data Source Information.md",
+    "documentation/CSU Hackathon - Geospatial AI Crop Yield Forecasting.md",
+    "documentation/agnext.md",
+    "documentation",
+    "Data Source Information.md",
     "hack26.code-workspace",
     "CSU Hackathon - Geospatial AI Crop Yield Forecasting.md",
     "context/onboarding.md",
