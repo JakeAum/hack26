@@ -349,6 +349,7 @@ def _load_sources(
     include_sentinel: bool,
     include_smap: bool,
     refresh: bool,
+    allow_download: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Pull counties + weather + cdl + nass through the existing engine APIs.
 
@@ -398,7 +399,9 @@ def _load_sources(
         # 30 m for 2024+ too (to keep per-year features comparable across history).
         res = 30
         try:
-            df = fetch_counties_cdl(counties, year=yr, resolution=res, refresh=refresh)
+            df = fetch_counties_cdl(counties, year=yr, resolution=res,
+                                     refresh=refresh,
+                                     allow_download=allow_download)
             df = df.assign(year=yr)
             cdl_pieces.append(df)
             sc.tick(extra=f"year={yr} rows={len(df)}")
@@ -566,6 +569,7 @@ def build_training_dataset(
     refresh: bool = False,
     require_label: bool = True,
     min_coverage_frac: float = 0.95,
+    allow_download: bool = False,
 ) -> TrainingBundle:
     """Assemble the per-(geoid, year) Darts bundle for **training** roles.
 
@@ -598,6 +602,7 @@ def build_training_dataset(
         include_sentinel=include_sentinel,
         include_smap=include_smap,
         refresh=refresh,
+        allow_download=allow_download,
     )
 
     banner("STEP 5/5  Assembling Darts TimeSeries", logger=logger)
@@ -808,6 +813,7 @@ def build_inference_dataset(
     refresh: bool = False,
     history_start_year: int = MIN_TRAIN_YEAR,
     history_end_year: int = MAX_TRAIN_YEAR,
+    allow_download: bool = False,
 ) -> TrainingBundle:
     """Assemble a bundle for **inference** at a future year (default 2025).
 
@@ -880,12 +886,14 @@ def build_inference_dataset(
     cdl: pd.DataFrame
     try:
         cdl = fetch_counties_cdl(counties, year=int(target_year), resolution=30,
-                                 refresh=refresh).assign(year=int(target_year))
+                                 refresh=refresh,
+                                 allow_download=allow_download).assign(year=int(target_year))
     except Exception as exc:  # noqa: BLE001
         logger.warning("CDL %d unavailable (%s); falling back to %d",
                        target_year, exc, MAX_TRAIN_YEAR)
         cdl = fetch_counties_cdl(counties, year=MAX_TRAIN_YEAR, resolution=30,
-                                 refresh=refresh).assign(year=int(target_year))
+                                 refresh=refresh,
+                                 allow_download=allow_download).assign(year=int(target_year))
 
     cdl_by_geoid = {str(r["geoid"]): r for _, r in cdl.iterrows()}
 
@@ -1025,6 +1033,11 @@ def _main(argv: list[str] | None = None) -> int:
                              "[sentinel] extra installed).")
     parser.add_argument("--refresh", action="store_true",
                         help="Force re-download of all underlying sources.")
+    parser.add_argument("--allow-download", action="store_true",
+                        help="Permit CDL raster downloads from USDA when a "
+                             "year is missing from the data root. Without "
+                             "this flag the engine stays in strict mode and "
+                             "skips missing CDL years (you'll see warnings).")
     parser.add_argument("--out-stats", type=Path, default=None,
                         help="Optional: write the series_index dataframe to a "
                              "parquet/CSV for inspection.")
@@ -1043,6 +1056,7 @@ def _main(argv: list[str] | None = None) -> int:
                 include_sentinel=args.include_sentinel,
                 include_smap=not args.no_smap,
                 refresh=args.refresh,
+                allow_download=args.allow_download,
             )
         else:
             bundle = build_training_dataset(
@@ -1052,6 +1066,7 @@ def _main(argv: list[str] | None = None) -> int:
                 include_sentinel=args.include_sentinel,
                 include_smap=not args.no_smap,
                 refresh=args.refresh,
+                allow_download=args.allow_download,
             )
     except ValueError as exc:
         logger.error("dataset build refused: %s", exc)

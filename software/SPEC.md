@@ -492,9 +492,32 @@ the USDA [NASS Quick Stats API](https://quickstats.nass.usda.gov/) for:
 - **(b)** state Aug/Sep/Oct/Nov in-season **forecasts** + annual final
   (USDA's public forecast line, used as the loss / comparison baseline).
 
-**Source.** Quick Stats `api_GET` (JSON) — `SURVEY`, `CORN` / `GRAIN`,
-`YIELD` / `BU / ACRE`, `agg_level` `COUNTY` (reference `YEAR` only) or
+**Source.** Quick Stats `api_GET` (JSON) — `source_desc=SURVEY`, corn-for-grain
+yields, `YIELD` / `BU / ACRE`, `agg_level` `COUNTY` (reference `YEAR` only) or
 `STATE` (refs `YEAR - AUG FORECAST` … `YEAR`).
+
+**Quick Stats query (corn for grain, yield).** NASS’s parameter validation is
+tight: invalid combinations return `HTTP 400` with
+`{"error":["bad request - invalid query"]}` — a generic message, so
+mis-set dimensions are hard to see without the response body.
+
+- **Class vs utilization.** For `commodity_desc=CORN`, Quick Stats no longer
+  accepts `class_desc=GRAIN`. Valid `class_desc` values (from
+  `api/get_param_values/?param=class_desc&commodity_desc=CORN`) are
+  `ALL CLASSES` and `TRADITIONAL OR INDIAN`. The grain/silage split is
+  carried by **`util_practice_desc`**: the engine uses
+  `util_practice_desc=GRAIN` for corn for grain. Sending the legacy
+  `class_desc=GRAIN` causes the 400 above.
+- **What we send.** The engine uses `class_desc=ALL CLASSES` together with
+  `prodn_practice_desc=ALL PRODUCTION PRACTICES`, `util_practice_desc=GRAIN`,
+  `statisticcat_desc=YIELD`, `unit_desc=BU / ACRE`, `domain_desc=TOTAL`, and
+  the usual `freq` / `reference` filters. Returned rows still carry
+  `short_desc` values such as `CORN, GRAIN - YIELD, MEASURED IN BU / ACRE`.
+- **Cache keys.** County and state cache filenames are
+  `corn_*_<state>_<start>_<end>.parquet` (see below). They are not
+  hash-addressed on query-string contents; the scientific slice
+  (`short_desc` / FIPS) is unchanged after the schema change, so existing
+  parquet caches remain valid for the same year ranges.
 
 **Auth.** Free API key — environment variable `NASS_API_KEY` (register at
 Quick Stats; never commit the key). Every public fetcher and the CLI fail
@@ -575,7 +598,7 @@ sequenceDiagram
         Cache-->>Pull: parquet
         Pull-->>Caller: filtered DataFrame
     else cache miss
-        Pull->>QS: GET (key, source=SURVEY, commodity=CORN, …)
+        Pull->>QS: GET (key, commodity=CORN, class=ALL CLASSES, util=GRAIN, …)
         QS-->>Pull: JSON `data`
         Pull->>Pull: drop OTHER/998 rows, normalize ids,<br/>parse "(D)"/"(X)"/"," etc. → float
         Pull->>Cache: write parquet

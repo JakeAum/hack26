@@ -33,12 +33,27 @@ import requests
 from ._cache import county_yields_path, state_forecasts_path
 
 # --- Quick Stats: corn for grain, yield in bu/acre
+#
+# NOTE (2026 NASS schema migration): NASS Quick Stats has consolidated all
+# corn ``class_desc`` values down to ``ALL CLASSES`` / ``TRADITIONAL OR
+# INDIAN`` and now expresses the grain-vs-silage distinction *only* via
+# ``util_practice_desc``. Sending the legacy ``class_desc=GRAIN`` returns
+# ``HTTP 400 {"error":["bad request - invalid query"]}``. The slice we want
+# (``CORN, GRAIN - YIELD, MEASURED IN BU / ACRE`` in ``short_desc``) is now
+# expressed as::
+#
+#     class_desc=ALL CLASSES, util_practice_desc=GRAIN
+#
+# The cached parquets from the previous schema are still scientifically
+# correct (same scientific slice, same ``short_desc``); the cache key is
+# ``(state_ansi, start_year, end_year)`` and not parameter-content-aware,
+# so existing files do not need invalidation.
 _COMMOD = "CORN"
-_CLASS = "GRAIN"
+_CLASS = "ALL CLASSES"
 _STAT = "YIELD"
 _UNIT = "BU / ACRE"
 _PRODN = "ALL PRODUCTION PRACTICES"
-_UTIL = "ALL UTILIZATION PRACTICES"
+_UTIL = "GRAIN"
 _SOURCE = "SURVEY"
 
 # County annual final only (NASS does not publish in-season at county).

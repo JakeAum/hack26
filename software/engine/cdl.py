@@ -408,6 +408,7 @@ def fetch_counties_cdl(
     year: int = 2025,
     resolution: int = 30,
     refresh: bool = False,
+    allow_download: bool = False,
 ) -> pd.DataFrame:
     """Vectorized version of :func:`fetch_county_cdl` over a county GeoDataFrame.
 
@@ -435,7 +436,8 @@ def fetch_counties_cdl(
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
 
-    tif = load_cdl(year=year, resolution=resolution, refresh=refresh)
+    tif = load_cdl(year=year, resolution=resolution, refresh=refresh,
+                   allow_download=allow_download)
 
     rows: list[dict] = []
     with rasterio.open(tif) as src:

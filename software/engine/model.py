@@ -780,6 +780,12 @@ def _main(argv: list[str] | None = None) -> int:
                         help="Skip SMAP soil moisture columns.")
     parser.add_argument("--refresh", action="store_true",
                         help="Force re-download of POWER/SMAP/CDL/NASS.")
+    parser.add_argument("--allow-download", action="store_true",
+                        help="Permit CDL raster downloads from USDA when a "
+                             "year is missing from the data root. Without "
+                             "this flag missing CDL years are skipped (the "
+                             "static covariates fall back to the nearest "
+                             "available year).")
     add_cli_logging_args(parser)
     args = parser.parse_args(argv)
 
@@ -818,6 +824,7 @@ def _main(argv: list[str] | None = None) -> int:
         include_sentinel=args.include_sentinel,
         include_smap=not args.no_smap,
         refresh=args.refresh,
+        allow_download=args.allow_download,
     )
     logger.info("[2025-leak-guard] year_split: train=%s val=%s test=%s; "
                 "2025_in_data=%s",

@@ -272,17 +272,20 @@ def _load_models(
     return out
 
 
-def _county_corn_area(target_year: int, counties: pd.DataFrame, refresh: bool) -> pd.DataFrame:
+def _county_corn_area(target_year: int, counties: pd.DataFrame, refresh: bool,
+                       allow_download: bool = False) -> pd.DataFrame:
     """Pull a single-year CDL frame so we can area-weight the state agg."""
     from engine.cdl import fetch_counties_cdl
     try:
         df = fetch_counties_cdl(counties, year=int(target_year),
-                                resolution=30, refresh=refresh)
+                                resolution=30, refresh=refresh,
+                                allow_download=allow_download)
     except Exception as exc:  # noqa: BLE001
         logger.warning("CDL %d unavailable (%s); falling back to %d",
                        target_year, exc, MAX_TRAIN_YEAR)
         df = fetch_counties_cdl(counties, year=MAX_TRAIN_YEAR,
-                                resolution=30, refresh=refresh)
+                                resolution=30, refresh=refresh,
+                                allow_download=allow_download)
     keep = [c for c in ("geoid", "corn_area_m2") if c in df.columns]
     return df[keep].copy() if keep else pd.DataFrame(
         {"geoid": counties["geoid"].astype(str), "corn_area_m2": 0.0}
@@ -301,6 +304,7 @@ def run_forecast(
     include_sentinel: bool = False,
     refresh: bool = False,
     num_samples: int = 200,
+    allow_download: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Run the full forecast pipeline. Returns a dict with keys:
 
@@ -335,6 +339,7 @@ def run_forecast(
         refresh=refresh,
         history_start_year=history_start,
         history_end_year=min(history_end, MAX_TRAIN_YEAR),
+        allow_download=allow_download,
     )
     logger.info("inference bundle: n_series=%d", bundle.n_series)
 
@@ -406,7 +411,8 @@ def run_forecast(
     logger.info("county analog cone: rows=%d", len(county_analog))
 
     # ---- state aggregation ----
-    cdl_meta = _county_corn_area(target_year, counties, refresh=refresh)
+    cdl_meta = _county_corn_area(target_year, counties, refresh=refresh,
+                                  allow_download=allow_download)
     state_df = aggregate_county_forecasts_to_state(
         county_forecasts=county_model,
         counties_meta=counties,
@@ -529,6 +535,10 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-sentinel", action="store_true")
     parser.add_argument("--no-smap", action="store_true")
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--allow-download", action="store_true",
+                        help="Permit CDL raster downloads from USDA when a "
+                             "year is missing from the data root. Without "
+                             "this flag missing CDL years are skipped.")
     parser.add_argument("--out", type=Path, default=None,
                         help="Primary output path for the per-state result. "
                              "Sibling files are written for county-level model "
@@ -565,6 +575,7 @@ def _main(argv: list[str] | None = None) -> int:
             include_sentinel=args.include_sentinel,
             refresh=args.refresh,
             num_samples=int(args.num_samples),
+            allow_download=args.allow_download,
         )
     except (ValueError, FileNotFoundError) as exc:
         logger.error("forecast aborted: %s", exc)
