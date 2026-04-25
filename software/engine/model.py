@@ -16,6 +16,9 @@ Public surface:
     evaluate_tft(predictions, labels) -> pd.DataFrame
     save_tft(model, path)
     load_tft(path) -> TFTModel
+    _BundleScaler                fits StandardScaler on train target+past+statics,
+                                 saved alongside the checkpoint and applied
+                                 transparently in train_tft / predict_tft.
     _main(argv)                  CLI:  hack26-train ...
 
 All training entry points enforce the 2025-strict-holdout: any
@@ -30,11 +33,13 @@ import argparse
 import json
 import logging
 import os
+import pickle
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -361,6 +366,11 @@ def save_tft(model, path: Path) -> Path:
         # Older Darts releases didn't expose ``clean=``; fall back and rely on
         # the upcoming load to ignore unpicklable callback state.
         model.save(str(path))
+    scaler = getattr(model, "_hack26_bundle_scaler", None)
+    scaler_path: Path | None = None
+    if scaler is not None:
+        scaler_path = _BundleScaler.sidecar_path_for(path)
+        scaler.save(scaler_path)
     meta = {
         "forecast_date": getattr(model, "_hack26_forecast_date", None),
         "input_chunk_length": int(model.input_chunk_length),
@@ -368,17 +378,24 @@ def save_tft(model, path: Path) -> Path:
         "quantiles": list(QUANTILES),
         "train_years": getattr(model, "_hack26_train_years", None),
         "val_year": getattr(model, "_hack26_val_year", None),
+        "has_bundle_scaler": scaler is not None,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
     sidecar = path.with_suffix(path.suffix + ".meta.json")
     with open(sidecar, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
-    logger.info("saved model -> %s   meta -> %s", path, sidecar)
+    if scaler_path is not None:
+        logger.info(
+            "saved model -> %s   meta -> %s   scaler -> %s",
+            path, sidecar, scaler_path,
+        )
+    else:
+        logger.info("saved model -> %s   meta -> %s   (no scaler)", path, sidecar)
     return path
 
 
 def load_tft(path: Path):
-    """Load a previously-saved TFTModel + sidecar metadata."""
+    """Load a previously-saved TFTModel + sidecar metadata + bundle scaler."""
     TFTModel = _import_tft_model()
     path = Path(path)
     if not path.exists():
@@ -394,7 +411,177 @@ def load_tft(path: Path):
                     path, meta.get("forecast_date"), meta.get("train_years"))
     else:
         logger.info("loaded model %s  (no sidecar metadata)", path)
+    scaler_path = _BundleScaler.sidecar_path_for(path)
+    if scaler_path.exists():
+        try:
+            setattr(
+                model, "_hack26_bundle_scaler", _BundleScaler.load(scaler_path)
+            )
+            logger.info("loaded bundle scaler -> %s", scaler_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "failed to load bundle scaler %s (%s); predictions will run on "
+                "raw inputs and may be wildly off-scale", scaler_path, exc,
+            )
+    else:
+        logger.info(
+            "no bundle scaler found at %s; assuming a legacy unscaled model",
+            scaler_path,
+        )
     return model
+
+
+# ---------------------------------------------------------------------------
+# Bundle scaler (fixes RMSE/coverage collapse from raw-magnitude features)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _BundleScaler:
+    """Per-component standardization for target, past covariates, and statics.
+
+    The TFT is sensitive to feature magnitudes; our raw past covariates
+    (``GDD_cumulative`` in the thousands, ``T2M`` in Kelvin) and statics
+    (``log_corn_area_m2`` ~20, one-hot state flags ~0/1, historical mean yield
+    ~190) span ~6 orders of magnitude. Without a scaler the variable-selection
+    pre-scaler ``Linear`` saturates on the dominant components and the model
+    collapses to near-zero output (see progress/mini-iowa.md).
+
+    This helper:
+      - fits a Darts :class:`Scaler` (sklearn ``StandardScaler``) on
+        ``train_bundle.target_series`` (so the model learns z-scored yields)
+      - fits a second :class:`Scaler` on ``train_bundle.past_covariates``
+      - manually z-scores the per-series ``static_covariates`` DataFrame
+        (Darts' ``Scaler`` deliberately ignores statics)
+      - persists itself next to the model checkpoint as
+        ``<ckpt>.scaler.pkl`` so :func:`load_tft` and :func:`predict_tft`
+        can transparently re-apply / inverse the transform.
+
+    Future covariates (``doy_sin/cos``, ``week_sin/cos``, ``month``,
+    ``days_until_end_of_season``) are intentionally **not** scaled — they're
+    already in well-behaved ranges and the calendar signal is interpretable.
+    """
+
+    target_scaler: Any = None
+    past_scaler: Any = None
+    static_means: pd.Series = field(default_factory=lambda: pd.Series(dtype="float32"))
+    static_stds: pd.Series = field(default_factory=lambda: pd.Series(dtype="float32"))
+    static_cols: list[str] = field(default_factory=list)
+
+    @staticmethod
+    def _make_value_scaler():
+        from darts.dataprocessing.transformers import Scaler
+        from sklearn.preprocessing import StandardScaler
+        try:
+            return Scaler(scaler=StandardScaler(), global_fit=True)
+        except TypeError:
+            # Older Darts releases didn't expose ``global_fit``; fall back to
+            # the default per-series fit (still better than no scaling).
+            return Scaler(scaler=StandardScaler())
+
+    @classmethod
+    def fit(cls, train_bundle: TrainingBundle) -> "_BundleScaler":
+        """Fit on training data only (val/test are transformed, not fit)."""
+        if train_bundle.n_series == 0:
+            raise ValueError("cannot fit _BundleScaler on an empty bundle")
+
+        tgt = cls._make_value_scaler()
+        tgt.fit(train_bundle.target_series)
+
+        past = cls._make_value_scaler()
+        past.fit(train_bundle.past_covariates)
+
+        static_frames = [
+            ts.static_covariates for ts in train_bundle.target_series
+            if ts.static_covariates is not None
+        ]
+        if static_frames:
+            stack = pd.concat(static_frames, ignore_index=True)
+            means = stack.mean(numeric_only=True).astype("float32")
+            stds = stack.std(numeric_only=True).astype("float32")
+            stds = stds.replace(0.0, 1.0).fillna(1.0)
+            cols = [c for c in stack.columns if c in means.index]
+        else:
+            means = pd.Series(dtype="float32")
+            stds = pd.Series(dtype="float32")
+            cols = []
+
+        logger.info(
+            "fit _BundleScaler: target+past = StandardScaler (global_fit), "
+            "static cols z-scored = %d", len(cols),
+        )
+        return cls(
+            target_scaler=tgt,
+            past_scaler=past,
+            static_means=means,
+            static_stds=stds,
+            static_cols=cols,
+        )
+
+    def _scale_static_frame(self, df: pd.DataFrame | None) -> pd.DataFrame | None:
+        if df is None or not self.static_cols:
+            return df
+        out = df.copy()
+        for c in self.static_cols:
+            if c not in out.columns:
+                continue
+            mean = float(self.static_means.get(c, 0.0))
+            std = float(self.static_stds.get(c, 1.0)) or 1.0
+            out[c] = (out[c].astype("float32") - mean) / std
+        return out.astype("float32")
+
+    def transform_target_series(self, series_list: Sequence) -> list:
+        """Scale target values **and** z-score the attached static frame."""
+        if not series_list:
+            return []
+        scaled = self.target_scaler.transform(list(series_list))
+        if not isinstance(scaled, list):
+            scaled = [scaled]
+        out: list = []
+        for ts in scaled:
+            sc = ts.static_covariates
+            new_sc = self._scale_static_frame(sc)
+            if new_sc is not None and (sc is None or not new_sc.equals(sc)):
+                ts = ts.with_static_covariates(new_sc)
+            out.append(ts)
+        return out
+
+    def transform_past(self, past_list: Sequence) -> list:
+        if not past_list:
+            return []
+        scaled = self.past_scaler.transform(list(past_list))
+        return scaled if isinstance(scaled, list) else [scaled]
+
+    def inverse_transform_predictions(self, preds: Sequence) -> list:
+        """Undo target scaling on a list of predicted ``TimeSeries``."""
+        if not preds:
+            return []
+        out = self.target_scaler.inverse_transform(list(preds))
+        return out if isinstance(out, list) else [out]
+
+    @staticmethod
+    def sidecar_path_for(model_path: Path) -> Path:
+        model_path = Path(model_path)
+        return model_path.with_suffix(model_path.suffix + ".scaler.pkl")
+
+    def save(self, path: Path) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "target_scaler": self.target_scaler,
+            "past_scaler": self.past_scaler,
+            "static_means": self.static_means,
+            "static_stds": self.static_stds,
+            "static_cols": self.static_cols,
+        }
+        with open(path, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        return path
+
+    @classmethod
+    def load(cls, path: Path) -> "_BundleScaler":
+        with open(path, "rb") as fh:
+            d = pickle.load(fh)
+        return cls(**d)
 
 
 # ---------------------------------------------------------------------------
@@ -499,15 +686,27 @@ def train_tft(
         precision=precision,
     )
 
+    # Standardize target + past + statics on the *training* slice so the
+    # model sees roughly N(0, 1) inputs instead of raw Kelvin / GDD-cumulative
+    # magnitudes. Predictions are inverse-transformed back to bu/acre in
+    # ``predict_tft`` via the same fitted scaler.
+    bundle_scaler = _BundleScaler.fit(train_bundle)
+    train_targets = bundle_scaler.transform_target_series(train_bundle.target_series)
+    train_past = bundle_scaler.transform_past(train_bundle.past_covariates)
+
     fit_kwargs: dict = {
-        "series": train_bundle.target_series,
-        "past_covariates": train_bundle.past_covariates,
+        "series": train_targets,
+        "past_covariates": train_past,
         "future_covariates": train_bundle.future_covariates,
         "verbose": True,
     }
     if val_bundle is not None and val_bundle.n_series > 0:
-        fit_kwargs["val_series"] = val_bundle.target_series
-        fit_kwargs["val_past_covariates"] = val_bundle.past_covariates
+        fit_kwargs["val_series"] = bundle_scaler.transform_target_series(
+            val_bundle.target_series
+        )
+        fit_kwargs["val_past_covariates"] = bundle_scaler.transform_past(
+            val_bundle.past_covariates
+        )
         fit_kwargs["val_future_covariates"] = val_bundle.future_covariates
 
     t0 = time.monotonic()
@@ -527,6 +726,7 @@ def train_tft(
     setattr(model, "_hack26_forecast_date", forecast_date)
     setattr(model, "_hack26_train_years", train_years)
     setattr(model, "_hack26_val_year", val_year)
+    setattr(model, "_hack26_bundle_scaler", bundle_scaler)
     return model
 
 
@@ -581,11 +781,28 @@ def predict_tft(
         else:
             truncated_targets.append(ts[:input_chunk])
 
+    # Apply the same StandardScaler the model was trained against (target +
+    # past + statics). Future covariates remain raw — the calendar features
+    # are already well-behaved.
+    bundle_scaler = getattr(model, "_hack26_bundle_scaler", None)
+    if bundle_scaler is None:
+        logger.warning(
+            "predict_tft: no _hack26_bundle_scaler attached to model; "
+            "inputs will be passed through raw and predictions left in the "
+            "model's training scale (likely meaningless if train_tft was run "
+            "with scaling)."
+        )
+        scaled_targets = truncated_targets
+        scaled_past = bundle.past_covariates
+    else:
+        scaled_targets = bundle_scaler.transform_target_series(truncated_targets)
+        scaled_past = bundle_scaler.transform_past(bundle.past_covariates)
+
     t0 = time.monotonic()
     predict_kwargs: dict = {
         "n": output_chunk,
-        "series": truncated_targets,
-        "past_covariates": bundle.past_covariates,
+        "series": scaled_targets,
+        "past_covariates": scaled_past,
         "future_covariates": bundle.future_covariates,
         "num_samples": num_samples,
         "verbose": False,
@@ -595,6 +812,8 @@ def predict_tft(
     preds = model.predict(**predict_kwargs)
     if not isinstance(preds, list):
         preds = [preds]
+    if bundle_scaler is not None:
+        preds = bundle_scaler.inverse_transform_predictions(preds)
     elapsed = time.monotonic() - t0
     logger.info("predict done in %.1fs (%.1f series/s)",
                 elapsed, bundle.n_series / max(elapsed, 1e-9))
