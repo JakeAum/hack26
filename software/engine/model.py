@@ -351,7 +351,16 @@ def save_tft(model, path: Path) -> Path:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    model.save(str(path))
+    # ``clean=True`` strips the PL ``Trainer`` (and its callbacks) before
+    # pickling. We attach a ``CsvEpochLogger`` defined inside a factory
+    # function for soft-dep reasons, and pickle can't relocate that local
+    # class on load. Cleaning sidesteps the issue and keeps artifacts small.
+    try:
+        model.save(str(path), clean=True)
+    except TypeError:
+        # Older Darts releases didn't expose ``clean=``; fall back and rely on
+        # the upcoming load to ignore unpicklable callback state.
+        model.save(str(path))
     meta = {
         "forecast_date": getattr(model, "_hack26_forecast_date", None),
         "input_chunk_length": int(model.input_chunk_length),
