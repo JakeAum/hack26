@@ -805,6 +805,14 @@ def _main(argv: list[str] | None = None) -> int:
         help="Ignore any on-disk training bundle and re-run the full "
              "weather/CDL/NASS pull (same as needing a fresh build).",
     )
+    parser.add_argument(
+        "--max-fetch-workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Parallel I/O for weather (per county), CDL (per year), and NASS "
+             "(per state). Use 1 for the legacy fully sequential pull.",
+    )
     add_cli_logging_args(parser)
     args = parser.parse_args(argv)
 
@@ -897,6 +905,7 @@ def _main(argv: list[str] | None = None) -> int:
             include_smap=not args.no_smap,
             refresh=args.refresh,
             allow_download=args.allow_download,
+            max_fetch_workers=int(args.max_fetch_workers),
         )
     logger.info("[2025-leak-guard] year_split: train=%s val=%s test=%s; "
                 "2025_in_data=%s",

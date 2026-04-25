@@ -20,6 +20,7 @@ prints a warning instead of crashing the merge.
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Iterable
 
@@ -178,15 +179,46 @@ def fetch_counties_sentinel(
     cloud_cover_lt: int = CLOUD_COVER_LT,
     resolution_m: int = 30,
     progress_every: int = 5,
+    max_workers: int = 1,
 ) -> pd.DataFrame:
     """Vectorized Sentinel-2 over a county GeoDataFrame.
 
     Each county is independent and individually cached; failures degrade to
     an empty per-county frame so one bad polygon doesn't poison the batch.
+    When ``max_workers`` > 1, counties are fetched concurrently.
     """
-    frames: list[pd.DataFrame] = []
-    n = len(counties)
-    for i, (_, row) in enumerate(counties.iterrows(), start=1):
+    rows = list(counties.iterrows())
+    n = len(rows)
+    if n == 0:
+        return _empty_result()
+
+    def _one(entry: tuple[int, tuple]) -> pd.DataFrame | None:
+        _, (_, row) = entry
+        return fetch_county_sentinel(
+            geoid=str(row["geoid"]),
+            geometry=row.geometry,
+            start_date=start_date,
+            end_date=end_date,
+            refresh=refresh,
+            cloud_cover_lt=cloud_cover_lt,
+            resolution_m=resolution_m,
+        )
+
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            dlist = list(ex.map(_one, list(enumerate(rows))))
+        frames = [df for df in dlist if df is not None and not df.empty]
+        print(
+            f"[weather.sentinel] {len(frames)}/{n} counties with data "
+            f"(max_workers={max_workers})",
+            file=sys.stderr,
+        )
+        if not frames:
+            return _empty_result()
+        return pd.concat(frames).sort_index()
+
+    frames = []
+    for i, (_, row) in enumerate(rows, start=1):
         df = fetch_county_sentinel(
             geoid=str(row["geoid"]),
             geometry=row.geometry,

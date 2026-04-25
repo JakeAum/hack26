@@ -305,6 +305,7 @@ def run_forecast(
     refresh: bool = False,
     num_samples: int = 200,
     allow_download: bool = False,
+    max_fetch_workers: int = 4,
 ) -> dict[str, pd.DataFrame]:
     """Run the full forecast pipeline. Returns a dict with keys:
 
@@ -331,6 +332,7 @@ def run_forecast(
                 len(counties),
                 sorted(counties["state_fips"].unique().tolist()))
 
+    w = max(1, int(max_fetch_workers))
     bundle = build_inference_dataset(
         states=states,
         target_year=target_year,
@@ -340,6 +342,7 @@ def run_forecast(
         history_start_year=history_start,
         history_end_year=min(history_end, MAX_TRAIN_YEAR),
         allow_download=allow_download,
+        max_fetch_workers=w,
     )
     logger.info("inference bundle: n_series=%d", bundle.n_series)
 
@@ -384,6 +387,7 @@ def run_forecast(
                 include_smap=include_smap,
                 include_sentinel=include_sentinel,
                 refresh=refresh,
+                max_workers=w,
             )
         if yields_cache is None:
             yields_cache = fetch_counties_nass_yields(
@@ -391,6 +395,7 @@ def run_forecast(
                 start_year=min(history_years),
                 end_year=max(history_years),
                 refresh=refresh,
+                max_workers=w,
             )
         a_df = analog_cones_for_counties(
             counties=counties,
@@ -543,6 +548,13 @@ def _main(argv: list[str] | None = None) -> int:
                         help="Primary output path for the per-state result. "
                              "Sibling files are written for county-level model "
                              "and analog cones.")
+    parser.add_argument(
+        "--max-fetch-workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Parallel I/O for weather/NASS during inference and analog prep.",
+    )
     add_cli_logging_args(parser)
     args = parser.parse_args(argv)
 
@@ -576,6 +588,7 @@ def _main(argv: list[str] | None = None) -> int:
             refresh=args.refresh,
             num_samples=int(args.num_samples),
             allow_download=args.allow_download,
+            max_fetch_workers=int(args.max_fetch_workers),
         )
     except (ValueError, FileNotFoundError) as exc:
         logger.error("forecast aborted: %s", exc)

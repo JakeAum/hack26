@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 import geopandas as gpd
@@ -312,10 +313,14 @@ def fetch_counties_nass_yields(
     start_year: int = 2000,
     end_year: int = 2024,
     refresh: bool = False,
+    max_workers: int = 4,
 ) -> pd.DataFrame:
     """Corn-for-grain **final** county yields for all rows in ``counties``
     (must have ``geoid``). One API + cache per distinct state; filters to
     requested geoids. Excludes NASS ``OTHER (COMBINED) COUNTIES`` aggregate rows.
+
+    When ``max_workers`` > 1, state-level pulls (each its own API + cache) run
+    concurrently (up to 5 for the five project states).
     """
     _validate_year_range(start_year, end_year)
     if "geoid" not in counties.columns:
@@ -328,10 +333,26 @@ def fetch_counties_nass_yields(
     for g in geoids:
         by_state.setdefault(g[:2], set()).add(g)
 
-    pieces: list[pd.DataFrame] = []
-    for st, gset in sorted(by_state.items()):
-        part = _pull_county_state(st, start_year, end_year, gset, refresh=refresh)
-        pieces.append(part)
+    state_items = sorted(by_state.items())
+    if not state_items:
+        return _normalize_county_yields([], None)
+
+    if max_workers <= 1 or len(state_items) == 1:
+        pieces = [
+            _pull_county_state(st, start_year, end_year, gset, refresh=refresh)
+            for st, gset in state_items
+        ]
+    else:
+        def _one(item: tuple[str, set[str]]) -> pd.DataFrame:
+            st, gset = item
+            return _pull_county_state(
+                st, start_year, end_year, gset, refresh=refresh,
+            )
+
+        w = min(max(1, int(max_workers)), len(state_items))
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            pieces = list(ex.map(_one, state_items))
+
     if not pieces:
         return _normalize_county_yields([], None)
     out = pd.concat(pieces, ignore_index=True)

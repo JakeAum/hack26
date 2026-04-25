@@ -11,7 +11,7 @@ This is the file that satisfies the SPEC §2 contract for the weather source:
 
 Public surface:
     fetch_county_weather(geoid, geometry, start_year, end_year, ...) -> DataFrame
-    fetch_counties_weather(counties, start_year, end_year, ...) -> DataFrame
+    fetch_counties_weather(counties, start_year, end_year, ..., max_workers=4) -> DataFrame
     merge_weather(power_df, smap_df, sentinel_df) -> DataFrame
     _main(argv) -> int   # CLI: python -m engine.weather
 
@@ -175,6 +175,7 @@ def fetch_counties_weather(
     refresh: bool = False,
     add_rolling: bool = True,
     sleep_between: float = 1.0,
+    max_workers: int = 4,
 ) -> pd.DataFrame:
     """Vectorized version over a county GeoDataFrame.
 
@@ -184,6 +185,10 @@ def fetch_counties_weather(
     parquet read — even though the underlying per-county pulls are also cached
     individually, materializing the merge once is ~free and saves the join
     cost on the hot path.
+
+    ``max_workers`` controls parallel NASA POWER + SMAP county fetches (1 =
+    legacy sequential + ``sleep_between`` throttling; 4+ recommended for
+    cold pulls). Sentinel uses the same cap when included.
     """
     cache = merged_cache_path(
         counties["geoid"], start_year, end_year, suffix="daily",
@@ -191,9 +196,12 @@ def fetch_counties_weather(
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
 
+    w = max(1, int(max_workers))
+
     power = fetch_counties_power(
         counties, start_year=start_year, end_year=end_year,
         parameters=parameters, refresh=refresh, sleep_between=sleep_between,
+        max_workers=w,
     )
 
     smap = None
@@ -201,6 +209,7 @@ def fetch_counties_weather(
         smap = fetch_counties_smap(
             counties, start_year=start_year, end_year=end_year,
             refresh=refresh, sleep_between=sleep_between,
+            max_workers=w,
         )
 
     sentinel = None
@@ -210,6 +219,7 @@ def fetch_counties_weather(
             start_date=f"{start_year}-01-01",
             end_date=f"{end_year}-12-31",
             refresh=refresh,
+            max_workers=w,
         )
 
     merged = merge_weather(power, smap, sentinel)
@@ -273,7 +283,15 @@ def _main(argv: list[str] | None = None) -> int:
                              "rebuild the merged parquet cache.")
     parser.add_argument("--sleep", type=float, default=1.0,
                         help="Seconds to sleep between live POWER calls (skipped "
-                             "on cached counties). Default 1.0.")
+                             "on cached counties). Default 1.0 — not used when "
+                             "--max-fetch-workers is greater than 1.")
+    parser.add_argument(
+        "--max-fetch-workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Parallel county fetches for POWER + SMAP + Sentinel (1 = sequential).",
+    )
     parser.add_argument("--out", type=Path, default=None,
                         help="Optional output path (.parquet or .csv) for the "
                              "daily frame.")
@@ -304,6 +322,7 @@ def _main(argv: list[str] | None = None) -> int:
         refresh=args.refresh,
         add_rolling=not args.no_rolling,
         sleep_between=args.sleep,
+        max_workers=int(args.max_fetch_workers),
     )
     print(_summarize(df, args.start, args.end))
 

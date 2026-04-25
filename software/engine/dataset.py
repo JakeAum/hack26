@@ -47,6 +47,7 @@ import json
 import logging
 import pickle
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -520,12 +521,17 @@ def _load_sources(
     include_smap: bool,
     refresh: bool,
     allow_download: bool = False,
+    max_fetch_workers: int = 4,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Pull counties + weather + cdl + nass through the existing engine APIs.
 
     Returns ``(counties, weather_daily, cdl_annual, nass_yields)``. Every
     sub-source uses its own parquet cache; the first cold pull is the slow
     one (POWER for 17 years × 443 counties). Subsequent calls are cache reads.
+
+    ``max_fetch_workers`` controls parallel I/O: NASA POWER/SMAP/Sentinel per
+    county, CDL per year, and NASS per state (``1`` disables — legacy
+    sequential behavior for weather layers that use ``sleep_between``).
     """
     from engine.cdl import fetch_counties_cdl
     from engine.counties import load_counties
@@ -544,6 +550,7 @@ def _load_sources(
         f"for {start_year}-{end_year}",
         logger=logger,
     )
+    w = max(1, int(max_fetch_workers))
     weather = fetch_counties_weather(
         counties,
         start_year=start_year,
@@ -551,6 +558,7 @@ def _load_sources(
         include_smap=include_smap,
         include_sentinel=include_sentinel,
         refresh=refresh,
+        max_workers=w,
     )
     logger.info(
         "weather frame: rows=%d  cols=%d  index=%s",
@@ -561,27 +569,61 @@ def _load_sources(
         f"STEP 3/5  Pulling CDL annual snapshots for {start_year}-{end_year}",
         logger=logger,
     )
-    cdl_pieces: list[pd.DataFrame] = []
-    sc = StepCounter(logger, total=end_year - start_year + 1, unit="years",
-                     every=1, prefix="cdl-years")
-    for yr in range(start_year, end_year + 1):
-        # Resolution: 30 m for everything before 2024 (only resolution available),
-        # 30 m for 2024+ too (to keep per-year features comparable across history).
+    years_list = list(range(start_year, end_year + 1))
+    n_years = len(years_list)
+    cdl_workers = min(w, n_years) if n_years else 1
+
+    def _cdl_one_year(yr: int) -> tuple[int, pd.DataFrame | None, str | None]:
         res = 30
         try:
-            df = fetch_counties_cdl(counties, year=yr, resolution=res,
-                                     refresh=refresh,
-                                     allow_download=allow_download)
-            df = df.assign(year=yr)
-            cdl_pieces.append(df)
-            sc.tick(extra=f"year={yr} rows={len(df)}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "CDL year %d unavailable (%s); proceeding without it. "
-                "Static covariates for that year will fall back to the "
-                "nearest available CDL year.",
-                yr, exc,
+            df = fetch_counties_cdl(
+                counties, year=yr, resolution=res,
+                refresh=refresh, allow_download=allow_download,
             )
+            return (yr, df.assign(year=yr), None)
+        except Exception as exc:  # noqa: BLE001
+            return (yr, None, str(exc))
+
+    cdl_pieces: list[pd.DataFrame] = []
+    if cdl_workers <= 1 or n_years <= 1:
+        sc = StepCounter(logger, total=n_years, unit="years",
+                         every=1, prefix="cdl-years")
+        for yr in years_list:
+            out_yr, df, err = _cdl_one_year(yr)
+            if err is not None:
+                logger.warning(
+                    "CDL year %d unavailable (%s); proceeding without it. "
+                    "Static covariates for that year will fall back to the "
+                    "nearest available CDL year.",
+                    out_yr, err,
+                )
+            elif df is not None:
+                cdl_pieces.append(df)
+                sc.tick(extra=f"year={out_yr} rows={len(df)}")
+    else:
+        logger.info(
+            "CDL years: parallel fetch (max_workers=%d) for %d years",
+            cdl_workers, n_years,
+        )
+        sc = StepCounter(logger, total=n_years, unit="years",
+                         every=1, prefix="cdl-years")
+        with ThreadPoolExecutor(max_workers=cdl_workers) as ex:
+            futures = {ex.submit(_cdl_one_year, yr): yr for yr in years_list}
+            for fut in as_completed(futures):
+                out_yr, df, err = fut.result()
+                if err is not None:
+                    logger.warning(
+                        "CDL year %d unavailable (%s); proceeding without it. "
+                        "Static covariates for that year will fall back to the "
+                        "nearest available CDL year.",
+                        out_yr, err,
+                    )
+                elif df is not None:
+                    cdl_pieces.append(df)
+                    sc.tick(extra=f"year={out_yr} rows={len(df)}")
+        # Restore chronological order for logging / sanity
+        cdl_pieces.sort(key=lambda d: int(d["year"].iloc[0]))
+
     cdl = pd.concat(cdl_pieces, ignore_index=True) if cdl_pieces else pd.DataFrame()
     logger.info(
         "cdl frame: rows=%d  years=%d  geoids=%d",
@@ -595,7 +637,11 @@ def _load_sources(
         logger=logger,
     )
     nass = fetch_counties_nass_yields(
-        counties, start_year=start_year, end_year=end_year, refresh=refresh
+        counties,
+        start_year=start_year,
+        end_year=end_year,
+        refresh=refresh,
+        max_workers=w,
     )
     # Hard guard: drop any 2025 row in case a refreshed NASS pull has it (NASS
     # doesn't publish 2025 finals yet, but the guard keeps us honest).
@@ -740,6 +786,7 @@ def build_training_dataset(
     require_label: bool = True,
     min_coverage_frac: float = 0.95,
     allow_download: bool = False,
+    max_fetch_workers: int = 4,
 ) -> TrainingBundle:
     """Assemble the per-(geoid, year) Darts bundle for **training** roles.
 
@@ -758,6 +805,8 @@ def build_training_dataset(
         min_coverage_frac: drop series whose past-covariate non-NaN coverage
             (after impute) falls below this — guards against malformed weather
             pulls.
+        max_fetch_workers: parallel I/O for weather counties, CDL years, and
+            NASS states (``1`` = fully sequential, legacy throttling for POWER).
 
     Returns:
         :class:`TrainingBundle`. ``n_series`` ≈ ``n_counties * (end - start + 1)``
@@ -773,6 +822,7 @@ def build_training_dataset(
         include_smap=include_smap,
         refresh=refresh,
         allow_download=allow_download,
+        max_fetch_workers=max_fetch_workers,
     )
 
     banner("STEP 5/5  Assembling Darts TimeSeries", logger=logger)
@@ -984,6 +1034,7 @@ def build_inference_dataset(
     history_start_year: int = MIN_TRAIN_YEAR,
     history_end_year: int = MAX_TRAIN_YEAR,
     allow_download: bool = False,
+    max_fetch_workers: int = 4,
 ) -> TrainingBundle:
     """Assemble a bundle for **inference** at a future year (default 2025).
 
@@ -1019,11 +1070,13 @@ def build_inference_dataset(
     logger.info("counties loaded: n=%d", len(counties))
 
     # Historical yields (strictly < target_year for the prior, drops 2025):
+    w = max(1, int(max_fetch_workers))
     nass_history = fetch_counties_nass_yields(
         counties,
         start_year=history_start_year,
         end_year=min(history_end_year, MAX_TRAIN_YEAR),
         refresh=refresh,
+        max_workers=w,
     )
     if (nass_history["year"].astype(int) == 2025).any():
         nass_history = nass_history[nass_history["year"].astype(int) != 2025]
@@ -1045,6 +1098,7 @@ def build_inference_dataset(
         include_smap=include_smap,
         include_sentinel=include_sentinel,
         refresh=refresh,
+        max_workers=w,
     )
     weather_season = _filter_to_growing_season(
         weather, start_doy=season_start_doy, end_doy=season_end_doy
@@ -1226,6 +1280,14 @@ def _main(argv: list[str] | None = None) -> int:
         help="Save the training bundle to PATH.pkl with PATH.meta.json. "
              "Takes precedence over --save-last-bundle if both are set.",
     )
+    parser.add_argument(
+        "--max-fetch-workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Parallel I/O for weather, CDL years, and NASS states. "
+             "Use 1 for a fully sequential fetch.",
+    )
     add_cli_logging_args(parser)
     args = parser.parse_args(argv)
 
@@ -1242,6 +1304,7 @@ def _main(argv: list[str] | None = None) -> int:
                 include_smap=not args.no_smap,
                 refresh=args.refresh,
                 allow_download=args.allow_download,
+                max_fetch_workers=int(args.max_fetch_workers),
             )
         else:
             bundle = build_training_dataset(
@@ -1252,6 +1315,7 @@ def _main(argv: list[str] | None = None) -> int:
                 include_smap=not args.no_smap,
                 refresh=args.refresh,
                 allow_download=args.allow_download,
+                max_fetch_workers=int(args.max_fetch_workers),
             )
     except ValueError as exc:
         logger.error("dataset build refused: %s", exc)
