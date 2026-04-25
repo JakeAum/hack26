@@ -25,6 +25,7 @@ Cache:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Sequence
@@ -99,6 +100,11 @@ _NODATA = -999.0
 # ---------------------------------------------------------------------------
 _SMAP_BROKEN_THIS_PROCESS: bool = False
 _SMAP_BREAK_REASON: str = ""
+# SMAP is probed from fetch_counties_smap with ThreadPoolExecutor; without a
+# lock, N threads can hit NASA before the first 422 sets _SMAP_BROKEN_*,
+# causing duplicate 422 spam. Serialize the failure path and post-failure
+# short-circuits.
+_SMAP_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -256,36 +262,42 @@ def fetch_county_smap(
     if _SMAP_BROKEN_THIS_PROCESS:
         return _empty_smap_frame(cache)
 
-    lat, lon = representative_latlon(geometry, county_row=county_row)
-    try:
-        raw = _fetch_power_point(
-            lat, lon, ("SMLAND",), effective_start, end_year,
-        )
-    except requests.HTTPError as exc:  # 422 / 4xx → degrade for the whole run
-        status = getattr(exc.response, "status_code", "?")
-        body = ""
-        if exc.response is not None:
-            try:
-                body = exc.response.text[:200].replace("\n", " ")
-            except Exception:  # noqa: BLE001
-                body = ""
-        reason = (
-            f"HTTP {status} for SMLAND@({lat:.3f},{lon:.3f}) "
-            f"{effective_start}-{end_year}; body={body!r}"
-        )
-        _LOG.warning("[weather.power] SMAP fetch failed for geoid=%s: %s",
-                     geoid, reason)
-        _mark_smap_broken(reason)
-        return _empty_smap_frame(cache)
-    except Exception as exc:  # noqa: BLE001 — SMAP gaps are common; degrade.
-        _LOG.warning("[weather.power] SMAP fetch failed for geoid=%s "
-                     "(%.3f,%.3f): %s", geoid, lat, lon, exc)
-        return _empty_smap_frame(cache)
+    with _SMAP_LOCK:
+        if _SMAP_BROKEN_THIS_PROCESS:
+            return _empty_smap_frame(cache)
+        if cache.exists() and not refresh:
+            return pd.read_parquet(cache)
 
-    raw = raw.rename(columns={"SMLAND": "SMAP_surface_sm_m3m3"})
-    raw = raw.assign(geoid=str(geoid)).set_index("geoid", append=True)
-    raw.to_parquet(cache)
-    return raw
+        lat, lon = representative_latlon(geometry, county_row=county_row)
+        try:
+            raw = _fetch_power_point(
+                lat, lon, ("SMLAND",), effective_start, end_year,
+            )
+        except requests.HTTPError as exc:  # 422 / 4xx → degrade for the whole run
+            status = getattr(exc.response, "status_code", "?")
+            body = ""
+            if exc.response is not None:
+                try:
+                    body = exc.response.text[:200].replace("\n", " ")
+                except Exception:  # noqa: BLE001
+                    body = ""
+            reason = (
+                f"HTTP {status} for SMLAND@({lat:.3f},{lon:.3f}) "
+                f"{effective_start}-{end_year}; body={body!r}"
+            )
+            # One banner from _mark_smap_broken — no per-geoid line (parallel
+            # SMAP would duplicate this N times before the flag existed).
+            _mark_smap_broken(reason)
+            return _empty_smap_frame(cache)
+        except Exception as exc:  # noqa: BLE001 — SMAP gaps are common; degrade.
+            _LOG.warning("[weather.power] SMAP fetch failed for geoid=%s "
+                         "(%.3f,%.3f): %s", geoid, lat, lon, exc)
+            return _empty_smap_frame(cache)
+        else:
+            raw = raw.rename(columns={"SMLAND": "SMAP_surface_sm_m3m3"})
+            raw = raw.assign(geoid=str(geoid)).set_index("geoid", append=True)
+            raw.to_parquet(cache)
+            return raw
 
 
 # ---------------------------------------------------------------------------
