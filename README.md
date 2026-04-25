@@ -1,5 +1,7 @@
 # Will Code for Corn 🌽❤️
 
+![hamster.png](hamster.png)
+
 ## The Challenge
 
 Accurate, timely corn yield forecasts shape decisions across food security, commodity markets, and agricultural policy yet traditional survey-based estimates remain slow, costly, and coarse. Our team is building a geospatial AI pipeline that turns Earth observation data into faster, more granular, and more trustworthy yield predictions.
