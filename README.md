@@ -8,3 +8,7 @@ Accurate, timely corn yield forecasts shape decisions across food security, comm
 
 Deliver a transparent, reproducible pipeline that helps farmers, analysts, and policymakers see the season ahead with greater confidence.
 
+```bash
+EFS=/mnt/custom-file-systems/efs/fs-014621b1d53629dd9_fsap-05629cb3c5373e174
+ln -s $EFS/cdls_data ~/hack26/data
+```ls
