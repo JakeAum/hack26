@@ -1,0 +1,13 @@
+{
+  "accentColor": "#1a90ff",
+  "theme": "moonstone",
+  "cssTheme": "",
+  "baseFontSize": 14,
+  "enabledCssSnippets": [],
+  "interfaceFontFamily": "Cascadia Mono",
+  "textFontFamily": "Cascadia Mono",
+  "monospaceFontFamily": "Cascadia Mono",
+  "showViewHeader": true,
+  "showRibbon": true,
+  "baseFontSizeAction": true
+}

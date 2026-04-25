@@ -1,0 +1,13 @@
+{
+  "alwaysUpdateLinks": true,
+  "spellcheck": false,
+  "defaultViewMode": "source",
+  "attachmentFolderPath": "Resources/Attachments",
+  "promptDelete": false,
+  "newFileLocation": "folder",
+  "newFileFolderPath": "",
+  "showUnsupportedFiles": true,
+  "showInlineTitle": true,
+  "readableLineLength": false,
+  "smartIndentList": true
+}
